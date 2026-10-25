@@ -1,0 +1,81 @@
+services:
+  panel:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: panel
+    restart: unless-stopped
+    init: true
+    expose:
+      - "3001"
+    environment:
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      PORT: "3001"
+      TRUST_PROXY: "true"
+      NODEBASE_SETUP_KEY: ${NODEBASE_SETUP_KEY:?Set NODEBASE_SETUP_KEY in Coolify}
+      NODEBASE_ENCRYPTION_KEY: ${NODEBASE_ENCRYPTION_KEY:?Set NODEBASE_ENCRYPTION_KEY in Coolify}
+      NODEBASE_STORAGE_ROOT: ${NODEBASE_HOST_DATA_ROOT:-/srv/nodebase/data}
+      NODEBASE_DATABASE_PATH: ${NODEBASE_HOST_DATA_ROOT:-/srv/nodebase/data}/db/nodebase.sqlite
+      NODEBASE_BOT_ROOT: ${NODEBASE_HOST_DATA_ROOT:-/srv/nodebase/data}/bots
+      NODEBASE_BLOB_ROOT: ${NODEBASE_HOST_DATA_ROOT:-/srv/nodebase/data}/file-blobs
+      NODEBASE_BACKUP_ROOT: ${NODEBASE_HOST_DATA_ROOT:-/srv/nodebase/data}/backups
+      NODEBASE_MAX_FILE_BYTES: ${NODEBASE_MAX_FILE_BYTES:-1073741824}
+      NODEBASE_MAX_STORAGE_BYTES: ${NODEBASE_MAX_STORAGE_BYTES:-107374182400}
+      NODEBASE_MAX_BOT_ZIP_BYTES: ${NODEBASE_MAX_BOT_ZIP_BYTES:-262144000}
+      NODEBASE_SESSION_DAYS: ${NODEBASE_SESSION_DAYS:-7}
+      RUNNER_URL: http://runner:3099
+      RUNNER_TOKEN: ${RUNNER_TOKEN:?Set RUNNER_TOKEN in Coolify}
+      FRONTEND_ORIGIN: ${FRONTEND_ORIGIN:?Set FRONTEND_ORIGIN to the panel HTTPS origin in Coolify}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    volumes:
+      - ${NODEBASE_HOST_DATA_ROOT:-/srv/nodebase/data}:${NODEBASE_HOST_DATA_ROOT:-/srv/nodebase/data}
+    networks:
+      - default
+      - runner-private
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3001/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  runner:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runner
+    restart: unless-stopped
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    expose:
+      - "3099"
+    environment:
+      NODE_ENV: production
+      RUNNER_HOST: 0.0.0.0
+      RUNNER_PORT: "3099"
+      RUNNER_TOKEN: ${RUNNER_TOKEN:?Set RUNNER_TOKEN in Coolify}
+      WORKSPACE_ROOT: ${NODEBASE_HOST_DATA_ROOT:-/srv/nodebase/data}/bots
+      DOCKER_SOCKET: /var/run/docker.sock
+      BOT_MEMORY_MB: ${BOT_MEMORY_MB:-512}
+      BOT_CPU_NANOS: ${BOT_CPU_NANOS:-500000000}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    volumes:
+      - ${NODEBASE_HOST_DATA_ROOT:-/srv/nodebase/data}:${NODEBASE_HOST_DATA_ROOT:-/srv/nodebase/data}:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+    group_add:
+      - "${DOCKER_GID:-999}"
+    networks:
+      - runner-private
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3099/health').then(r=>r.json()).then(d=>process.exit(d.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+networks:
+  runner-private:
+    internal: true
