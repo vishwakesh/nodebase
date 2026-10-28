@@ -64,6 +64,7 @@ function csrfOk(request: FastifyRequest) {
 app.addHook('onRequest', async (request, reply) => {
   const pathname = requestPath(request);
   if (!pathname.startsWith('/api/')) return;
+  if (pathname.startsWith('/api/agent/')) return; // Agent routes authenticate with per-node bearer credentials.
   if (!['GET', 'HEAD', 'OPTIONS'].includes(request.method) && !csrfOk(request)) {
     return reply.code(403).send({ error: { code: 'CSRF_INVALID', message: 'Security token missing or expired. Refresh the page and try again.' } });
   }
@@ -214,6 +215,129 @@ app.get('/api/dashboard', async () => {
   const metrics = safeStatMetrics();
   const statusCounts = { running: bots.filter(b => b.status === 'running').length, stopped: bots.filter(b => b.status === 'stopped').length, crashed: bots.filter(b => b.status === 'crashed').length };
   return { bots: { total: bots.length, ...statusCounts }, resources: metrics, storage: { usedBytes: cloud.bytes, fileCount: cloud.files, limitBytes: config.maxStorageBytes, percent: Math.min(100, Math.round(cloud.bytes / config.maxStorageBytes * 100)) }, runner: runnerHealth, recentBots: bots.slice(0, 5).map(({ container_id, ...bot }) => bot), recentFiles, activity };
+});
+
+// Multi-node control plane foundation. The agent initiates outbound HTTPS requests; no node management port is exposed.
+const enrollmentSchema = z.object({ label: z.string().trim().min(2).max(80).default('Hosting node') });
+const enrollAgentSchema = z.object({
+  name: z.string().trim().min(2).max(80),
+  region: z.string().trim().max(80).default(''),
+  agentVersion: z.string().trim().min(1).max(40).default('unknown'),
+  runtimes: z.array(z.enum(['python','node'])).min(1).max(2).default(['python','node']),
+  cpuCores: z.number().int().min(0).max(4096).default(0),
+  memoryTotalBytes: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).default(0),
+  storageTotalBytes: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).default(0),
+});
+const heartbeatSchema = z.object({
+  agentVersion: z.string().trim().min(1).max(40),
+  cpuPercent: z.number().min(0).max(100).nullable().optional(),
+  memoryTotalBytes: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+  memoryUsedBytes: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+  storageTotalBytes: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+  storageUsedBytes: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+  workloadCount: z.number().int().min(0).max(100000).nullable().optional(),
+  runtimes: z.array(z.enum(['python','node'])).min(1).max(2),
+});
+function bearerValue(request: FastifyRequest) {
+  const value = request.headers.authorization ?? '';
+  const match = /^Bearer ([A-Za-z0-9_-]{32,128})$/.exec(value);
+  return match?.[1] ?? '';
+}
+function agentNode(request: FastifyRequest) {
+  const token = bearerValue(request);
+  if (!token) throw Object.assign(new Error('Node credential is missing.'), { statusCode: 401 });
+  const node = db.prepare('SELECT * FROM nodes WHERE token_hash=?').get(sha256(token)) as any;
+  if (!node || node.status === 'revoked' || !node.token_hash) throw Object.assign(new Error('Node credential is invalid or revoked.'), { statusCode: 401 });
+  return node;
+}
+function nodeView(row: any) {
+  const lastHeartbeat = row.last_heartbeat_at ? new Date(row.last_heartbeat_at).getTime() : 0;
+  const fresh = lastHeartbeat > 0 && Date.now() - lastHeartbeat <= 90_000;
+  // Heartbeat freshness takes precedence over last-known scheduler state.
+  let status = row.status === 'revoked' ? 'revoked' : !fresh ? 'offline' : row.status === 'draining' ? 'draining' : row.status === 'unhealthy' ? 'unhealthy' : 'online';
+  return {
+    id: row.id, name: row.name, region: row.region, agentVersion: row.agent_version,
+    runtimes: JSON.parse(row.runtimes_json || '["python","node"]'), cpuCores: row.cpu_cores,
+    cpuPercent: row.cpu_percent, memoryTotalBytes: row.memory_total_bytes, memoryUsedBytes: row.memory_used_bytes,
+    storageTotalBytes: row.storage_total_bytes, storageUsedBytes: row.storage_used_bytes,
+    workloadCount: row.workload_count, status, tokenSuffix: row.token_suffix,
+    lastHeartbeatAt: row.last_heartbeat_at, createdAt: row.created_at, updatedAt: row.updated_at,
+    heartbeatAgeSeconds: lastHeartbeat ? Math.max(0, Math.floor((Date.now() - lastHeartbeat) / 1000)) : null,
+  };
+}
+app.get('/api/nodes', async () => {
+  const rows = db.prepare(`SELECT * FROM nodes WHERE status <> 'revoked' ORDER BY created_at DESC`).all() as any[];
+  const nodes = rows.map(nodeView);
+  return { nodes, summary: { total: nodes.length, online: nodes.filter(n => n.status === 'online').length, offline: nodes.filter(n => n.status === 'offline').length, unhealthy: nodes.filter(n => n.status === 'unhealthy').length, draining: nodes.filter(n => n.status === 'draining').length } };
+});
+app.post('/api/nodes/enrollment-tokens', async (request, reply) => {
+  const body = parseBody(enrollmentSchema, request.body ?? {});
+  const id = randomUUID(); const token = randomToken(32); const now = nowIso();
+  const expiresAt = new Date(Date.now() + 15 * 60_000).toISOString();
+  db.prepare('INSERT INTO node_enrollment_tokens (id,label,token_hash,created_by,expires_at,created_at) VALUES (?,?,?,?,?,?)')
+    .run(id, body.label, sha256(token), request.admin!.id, expiresAt, now);
+  addActivity('node', 'Created a short-lived node enrollment token', { label: body.label, expiresAt });
+  return reply.code(201).send({ token, expiresAt, label: body.label, note: 'This token is shown once. Keep it private and use it within 15 minutes.' });
+});
+app.post('/api/agent/enroll', { config: { rateLimit: { max: 10, timeWindow: '1 minute' } } }, async (request, reply) => {
+  const body = parseBody(enrollAgentSchema, request.body);
+  const provided = bearerValue(request);
+  if (!provided) throw Object.assign(new Error('Enrollment token is required.'), { statusCode: 401 });
+  const enrollment = db.prepare('SELECT * FROM node_enrollment_tokens WHERE token_hash=?').get(sha256(provided)) as any;
+  const now = nowIso();
+  if (!enrollment || enrollment.used_at || enrollment.expires_at <= now) throw Object.assign(new Error('Enrollment token is invalid, expired, or already used.'), { statusCode: 401 });
+  const id = randomUUID(); const nodeToken = randomToken(32);
+  const createNode = db.transaction(() => {
+    const claimed = db.prepare('UPDATE node_enrollment_tokens SET used_at=? WHERE id=? AND used_at IS NULL AND expires_at>?').run(now, enrollment.id, now);
+    if (claimed.changes !== 1) throw Object.assign(new Error('Enrollment token has already been used.'), { statusCode: 409 });
+    db.prepare(`INSERT INTO nodes (id,name,region,agent_version,runtimes_json,cpu_cores,memory_total_bytes,storage_total_bytes,status,token_hash,token_suffix,last_heartbeat_at,created_at,updated_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(id, body.name, body.region, body.agentVersion, JSON.stringify(body.runtimes), body.cpuCores, body.memoryTotalBytes, body.storageTotalBytes, 'offline', sha256(nodeToken), nodeToken.slice(-6), null, now, now);
+  });
+  createNode();
+  addActivity('node', `Hosting node enrolled: ${body.name}`, { nodeId: id, region: body.region });
+  const node = db.prepare('SELECT * FROM nodes WHERE id=?').get(id) as any;
+  return reply.code(201).send({ node: nodeView(node), nodeToken, heartbeatIntervalSeconds: 30 });
+});
+app.post('/api/agent/heartbeat', { config: { rateLimit: { max: 120, timeWindow: '1 minute' } } }, async (request) => {
+  const node = agentNode(request);
+  const body = parseBody(heartbeatSchema, request.body);
+  const now = nowIso();
+  const status = node.status === 'draining' ? 'draining' : 'online';
+  db.prepare(`UPDATE nodes SET agent_version=?,runtimes_json=?,cpu_percent=?,memory_total_bytes=?,memory_used_bytes=?,storage_total_bytes=?,storage_used_bytes=?,workload_count=?,status=?,last_heartbeat_at=?,last_error=NULL,updated_at=? WHERE id=?`)
+    .run(body.agentVersion, JSON.stringify(body.runtimes), body.cpuPercent ?? null, body.memoryTotalBytes, Math.min(body.memoryUsedBytes, body.memoryTotalBytes), body.storageTotalBytes, Math.min(body.storageUsedBytes, body.storageTotalBytes), body.workloadCount ?? null, status, now, now, node.id);
+  return { ok: true, serverTime: now, nextHeartbeatSeconds: 30 };
+});
+app.get('/api/nodes/:id', async (request) => {
+  const { id } = request.params as { id: string };
+  const row = db.prepare('SELECT * FROM nodes WHERE id=? AND status <> \'revoked\'').get(id) as any;
+  if (!row) throw notFound('Node not found.');
+  return { node: nodeView(row) };
+});
+app.post('/api/nodes/:id/drain', async (request) => {
+  const { id } = request.params as { id: string };
+  const row = db.prepare('SELECT id,name,status FROM nodes WHERE id=? AND status <> \'revoked\'').get(id) as any;
+  if (!row) throw notFound('Node not found.');
+  db.prepare("UPDATE nodes SET status='draining',updated_at=? WHERE id=?").run(nowIso(), id);
+  addActivity('node', `Node marked draining: ${row.name}`, { nodeId: id });
+  return { ok: true };
+});
+app.post('/api/nodes/:id/accept-workloads', async (request) => {
+  const { id } = request.params as { id: string };
+  const row = db.prepare('SELECT id,name,last_heartbeat_at FROM nodes WHERE id=? AND status <> \'revoked\'').get(id) as any;
+  if (!row) throw notFound('Node not found.');
+  if (!row.last_heartbeat_at || Date.now() - new Date(row.last_heartbeat_at).getTime() > 90_000) throw conflict('Node has not sent a recent heartbeat; it cannot accept workloads yet.');
+  db.prepare("UPDATE nodes SET status='online',updated_at=? WHERE id=?").run(nowIso(), id);
+  addActivity('node', `Node accepting workloads: ${row.name}`, { nodeId: id });
+  return { ok: true };
+});
+app.delete('/api/nodes/:id', async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const row = db.prepare('SELECT id,name FROM nodes WHERE id=? AND status <> \'revoked\'').get(id) as any;
+  if (!row) throw notFound('Node not found.');
+  // Revocation invalidates its credential without making claims about the workload state on the host.
+  db.prepare("UPDATE nodes SET status='revoked',token_hash=NULL,token_suffix=NULL,last_error='Credential revoked',updated_at=? WHERE id=?").run(nowIso(), id);
+  addActivity('security', `Node credential revoked: ${row.name}`, { nodeId: id });
+  return reply.code(204).send();
 });
 
 // Bots — lifecycle operations are delegated to the separately authenticated runner.

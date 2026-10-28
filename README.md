@@ -4,6 +4,19 @@
 
 > **Deployment status:** This repository is a fresh implementation. It has not been deployed to your VPS from this workspace. Run the build and test steps below, then deploy through your existing Coolify instance. The bot runner requires Docker socket access on the host and is deliberately kept on a private Compose network.
 
+## V2 development status
+
+The branch `feat/nodebase-v2-foundation` introduces a first multi-node connectivity slice while preserving the existing V1 flow:
+
+- Add a Hosting Nodes section to the mobile-responsive panel.
+- Issue 15-minute, single-use enrollment tokens for authenticated administrators.
+- Enroll a remote node agent over HTTPS and exchange the enrollment secret for a unique credential.
+- Store only hashes of enrollment and node credentials on the control plane.
+- Report node heartbeats and real host CPU, memory, disk, and declared runtime telemetry.
+- Mark nodes offline when heartbeats are older than 90 seconds; expose drain, re-enable, and credential-revoke controls.
+
+This is an incremental foundation, not a claim that remote bot lifecycle scheduling is complete. The node agent currently reports connectivity and telemetry. Remote bot container creation, command acknowledgements, remote logs, and placement/scheduling remain future work. See [`docs/V2-ARCHITECTURE.md`](docs/V2-ARCHITECTURE.md) for the current scope and agent installation guide.
+
 ## Included in this MVP
 
 - First-run admin setup protected by `NODEBASE_SETUP_KEY`; no default account, no public registration.
