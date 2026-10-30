@@ -127,6 +127,20 @@ test('node enrollment tokens are single-use and agent heartbeats update real nod
   assert.equal(found.workloadCount, 2);
   assert.equal(listed.body.includes(nodeToken), false);
 
+  const drained = await app.inject({
+    method: 'POST', url: `/api/nodes/${node.id}/drain`,
+    headers: { cookie, 'x-csrf-token': csrf }, payload: {},
+  });
+  assert.equal(drained.statusCode, 200);
+  const heartbeatWhileDraining = await app.inject({
+    method: 'POST', url: '/api/agent/heartbeat',
+    headers: { authorization: `Bearer ${nodeToken}`, 'content-type': 'application/json' },
+    payload: { agentVersion: 'test-1', cpuPercent: 24, memoryTotalBytes: 8_000_000_000, memoryUsedBytes: 2_100_000_000, storageTotalBytes: 100_000_000_000, storageUsedBytes: 40_000_000_000, workloadCount: 2, runtimes: ['python', 'node'] },
+  });
+  assert.equal(heartbeatWhileDraining.statusCode, 200);
+  const drainingList = await app.inject({ method: 'GET', url: '/api/nodes', headers: { cookie } });
+  assert.equal(drainingList.json().nodes.find((n: any) => n.id === node.id).status, 'draining');
+
   const unauthenticated = await app.inject({
     method: 'POST', url: '/api/agent/heartbeat',
     headers: { 'content-type': 'application/json' },

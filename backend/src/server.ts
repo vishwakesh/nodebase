@@ -302,9 +302,13 @@ app.post('/api/agent/heartbeat', { config: { rateLimit: { max: 120, timeWindow: 
   const node = agentNode(request);
   const body = parseBody(heartbeatSchema, request.body);
   const now = nowIso();
-  const status = node.status === 'draining' ? 'draining' : 'online';
-  db.prepare(`UPDATE nodes SET agent_version=?,runtimes_json=?,cpu_percent=?,memory_total_bytes=?,memory_used_bytes=?,storage_total_bytes=?,storage_used_bytes=?,workload_count=?,status=?,last_heartbeat_at=?,last_error=NULL,updated_at=? WHERE id=?`)
-    .run(body.agentVersion, JSON.stringify(body.runtimes), body.cpuPercent ?? null, body.memoryTotalBytes, Math.min(body.memoryUsedBytes, body.memoryTotalBytes), body.storageTotalBytes, Math.min(body.storageUsedBytes, body.storageTotalBytes), body.workloadCount ?? null, status, now, now, node.id);
+  const tokenHash = sha256(bearerValue(request));
+  // Compare the credential again in the UPDATE. This closes a race where an
+  // in-flight heartbeat could otherwise restore a node after an admin revoked it.
+  // Keep a concurrent drain operation intact as well.
+  const updated = db.prepare(`UPDATE nodes SET agent_version=?,runtimes_json=?,cpu_percent=?,memory_total_bytes=?,memory_used_bytes=?,storage_total_bytes=?,storage_used_bytes=?,workload_count=?,status=CASE WHEN status='draining' THEN 'draining' ELSE 'online' END,last_heartbeat_at=?,last_error=NULL,updated_at=? WHERE id=? AND token_hash=? AND status<>'revoked'`)
+    .run(body.agentVersion, JSON.stringify(body.runtimes), body.cpuPercent ?? null, body.memoryTotalBytes, Math.min(body.memoryUsedBytes, body.memoryTotalBytes), body.storageTotalBytes, Math.min(body.storageUsedBytes, body.storageTotalBytes), body.workloadCount ?? null, now, now, node.id, tokenHash);
+  if (updated.changes !== 1) throw Object.assign(new Error('Node credential is invalid or revoked.'), { statusCode: 401 });
   return { ok: true, serverTime: now, nextHeartbeatSeconds: 30 };
 });
 app.get('/api/nodes/:id', async (request) => {
