@@ -1,0 +1,19 @@
+# Deploy this file on a separate hosting VPS; it does not expose a management port or mount the Docker socket.
+services:
+  nodebase-agent:
+    build:
+      context: ./agent
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    init: true
+    env_file:
+      - .env.agent
+    environment:
+      NODEBASE_AGENT_TOKEN_FILE: /var/lib/nodebase-agent/credentials.json
+      NODEBASE_AGENT_STORAGE_PATH: /host-data
+    volumes:
+      - nodebase-agent-credentials:/var/lib/nodebase-agent
+      - /srv/nodebase:/host-data:ro
+
+volumes:
+  nodebase-agent-credentials:

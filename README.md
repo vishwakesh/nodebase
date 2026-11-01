@@ -1,8 +1,29 @@
-# NODEBASE
+# NODEBASE V3 — Development Branch
 
-**A self-hosted Discord bot workspace and private file cloud.** NODEBASE is designed for one administrator on one VPS, with a React dashboard, a Fastify API, SQLite metadata, private disk-backed file objects, and a separate authenticated Docker runner.
+**Build. Debug. Deploy. Organize. Connect.**
+
+This branch (`feat/nodebase-v3-workspace`) begins the V3 design-system and workspace migration using the approved V2 multi-node foundation. The current increment implements the Obsidian + Acid Lime tokens, balanced layout primitives, and System/Light/Dark theme behavior. Existing V2 hosting, nodes, bot workspaces, backups, activity, and Cloud screens are retained as the functional baseline while V3 modules are implemented incrementally.
+
+V3 AI Builder, NVIDIA provider workflows, Bug Hunter, Auto Fixer, Auto Setup, Notes, and Watch Together are not yet implemented in this source snapshot. See [`docs/v3/IMPLEMENTATION-STATUS.md`](docs/v3/IMPLEMENTATION-STATUS.md) and [`docs/v3/ROADMAP.md`](docs/v3/ROADMAP.md). Do not treat this branch as a production-complete V3 release.
+
+**Existing foundation:** A self-hosted Discord bot workspace and private file cloud. The current implementation uses a React dashboard, Fastify API, SQLite metadata, private disk-backed file objects, and a separate authenticated Docker runner.
+
+ NODEBASE is designed for one administrator on one VPS, with a React dashboard, a Fastify API, SQLite metadata, private disk-backed file objects, and a separate authenticated Docker runner.
 
 > **Deployment status:** This repository is a fresh implementation. It has not been deployed to your VPS from this workspace. Run the build and test steps below, then deploy through your existing Coolify instance. The bot runner requires Docker socket access on the host and is deliberately kept on a private Compose network.
+
+## Preserved V2 multi-node foundation
+
+The branch `feat/nodebase-v2-foundation` introduces a first multi-node connectivity slice while preserving the existing V1 flow:
+
+- Add a Hosting Nodes section to the mobile-responsive panel.
+- Issue 15-minute, single-use enrollment tokens for authenticated administrators.
+- Enroll a remote node agent over HTTPS and exchange the enrollment secret for a unique credential.
+- Store only hashes of enrollment and node credentials on the control plane.
+- Report node heartbeats and real host CPU, memory, disk, and declared runtime telemetry.
+- Mark nodes offline when heartbeats are older than 90 seconds; expose drain, re-enable, and credential-revoke controls.
+
+This is an incremental foundation, not a claim that remote bot lifecycle scheduling is complete. The node agent currently reports connectivity and telemetry. Remote bot container creation, command acknowledgements, remote logs, and placement/scheduling remain future work. See [`docs/V2-ARCHITECTURE.md`](docs/V2-ARCHITECTURE.md) for the current scope and agent installation guide.
 
 ## Included in this MVP
 
