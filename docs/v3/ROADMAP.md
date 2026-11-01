@@ -18,7 +18,7 @@
 6. AI Auto Setup: read-only diagnostics first; approval-gated low/high-impact operations.
 7. Cloud enhancements and Notes with autosave/conflict handling.
 8. Hosting integration and end-to-end node-to-bot workflows.
-9. NODEBASE Watch: authorized media uploads, isolated HLS processing, invite-only rooms and synchronized playback.
+9. NODEBASE Watch: first progressive MP4/WebM room alpha is implemented on `feat/nodebase-watch`; next add resumable uploads, isolated HLS processing, authenticated segment delivery and WebSocket playback synchronization.
 10. Security review, mobile testing, production database migration and isolated deployment.
 
 ## First V3 vertical slice

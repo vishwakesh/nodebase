@@ -8,8 +8,9 @@ import {
   List, LoaderCircle, LockKeyhole, LogOut, Menu, MoreHorizontal, Network, Pause, Play, Plus, RefreshCw, MapPin,
   Search, Server, Settings, ShieldCheck, SlidersHorizontal, Square, SquareTerminal, Trash2, Upload, User,
   Users, X, CheckCheck, Database, Gauge, Clock3, Laptop, Sun, Moon, CloudUpload, CircleHelp, FileWarning,
-  RotateCcw, Pencil, DownloadCloud, Terminal, Save, ExternalLink, FilePlus2, PanelLeftClose, PanelLeftOpen,
+  RotateCcw, Pencil, DownloadCloud, Terminal, Save, ExternalLink, FilePlus2, PanelLeftClose, PanelLeftOpen, PlayCircle,
 } from 'lucide-react';
+import { WatchPage, WatchInviteAccess, WatchGuestRoom } from './features/watch/WatchPage.js';
 import './styles.css';
 
 type UserInfo = { id: string; username: string; email: string; displayName: string };
@@ -17,7 +18,7 @@ type BotRow = { id: string; name: string; runtime: 'python'|'node'; entrypoint: 
 type FolderRow = { id: string; name: string; parent_id: string|null; created_at?: string; updated_at?: string };
 type FileRow = { id: string; name: string; folder_id: string|null; size: number; mime_type: string; created_at: string; updated_at: string };
 type UploadItem = { id: string; name: string; size: number; progress: number; uploaded: number; speed: number; status: 'queued'|'uploading'|'completed'|'failed'|'cancelled'; error?: string; file: File };
-type Page = 'overview'|'bots'|'files'|'nodes'|'backups'|'activity'|'settings'|'console';
+type Page = 'overview'|'bots'|'files'|'nodes'|'backups'|'activity'|'settings'|'console'|'watch';
 
 type ThemePreference = 'light'|'dark'|'system';
 function readInitialThemePreference(): ThemePreference {
@@ -66,6 +67,7 @@ function App(){
   const [csrf,setCsrf]=useState(''); const [setupRequired,setSetupRequired]=useState<boolean|null>(null); const [setupKeyConfigured,setSetupKeyConfigured]=useState(true);
   const [user,setUser]=useState<UserInfo|null>(null); const [checking,setChecking]=useState(true); const [authLoading,setAuthLoading]=useState(false); const [authError,setAuthError]=useState('');
   const [page,setPage]=useState<Page>('overview'); const [sidebarOpen,setSidebarOpen]=useState(false); const [collapsed,setCollapsed]=useState(false); const [currentBotId,setCurrentBotId]=useState<string|null>(null); const [botTab,setBotTab]=useState('console');
+  const [watchInviteToken,setWatchInviteToken]=useState(()=>new URLSearchParams(window.location.hash.replace(/^#/, '')).get('watchInvite') ?? new URLSearchParams(window.location.search).get('watchInvite')); const [watchGuestRoomId,setWatchGuestRoomId]=useState(()=>new URLSearchParams(window.location.search).get('watchRoom'));
   const [toast,setToast]=useState<{message:string;type:'success'|'error'|'info'}|null>(null); const [theme,setTheme]=useState<ThemePreference>(initialThemePreference);
   const ping=useCallback((message:string,type:'success'|'error'|'info'='success')=>{setToast({message,type});window.setTimeout(()=>setToast(null),3400)},[]);
   const loadAuth=useCallback(async()=>{
@@ -83,6 +85,8 @@ function App(){
     return()=>media.removeEventListener('change',apply);
   },[theme]);
   if(checking) return <div className="boot-screen"><div className="brand-mark large"><Network size={25}/></div><span className="wordmark">nodebase</span><LoaderCircle className="spin" size={20}/><p>Connecting to your workspace…</p></div>;
+  if(watchInviteToken) return <WatchInviteAccess api={API} token={watchInviteToken} onJoined={id=>{setWatchInviteToken(null);setWatchGuestRoomId(id);window.history.replaceState({},'',`/?watchRoom=${encodeURIComponent(id)}`)}}/>;
+  if(watchGuestRoomId) return <WatchGuestRoom api={API} roomId={watchGuestRoomId}/>;
   if(!user) return <AuthScreen setupRequired={Boolean(setupRequired)} setupKeyConfigured={setupKeyConfigured} error={authError} loading={authLoading} onSubmit={async(data,mode)=>{setAuthError('');setAuthLoading(true);try{const url=mode==='setup'?'/api/auth/setup':'/api/auth/login';const res=await API<{user:UserInfo}>(url,{method:'POST',body:JSON.stringify(data)});setUser(res.user);setPage('overview');ping(mode==='setup'?'Workspace created. Welcome to NODEBASE.':'Welcome back.');}catch(e){setAuthError((e as Error).message)}finally{setAuthLoading(false)}}}/>;
   return <div className="app-shell">
     <Sidebar page={page} setPage={setPage} open={sidebarOpen} setOpen={setSidebarOpen} collapsed={collapsed} setCollapsed={setCollapsed} setBotId={id=>{setCurrentBotId(id);setPage('console');setBotTab('console')}} />
@@ -91,6 +95,7 @@ function App(){
       {page==='overview'&&<Overview setPage={setPage} setBot={id=>{setCurrentBotId(id);setPage('console')}} onUpload={()=>{setPage('files');window.setTimeout(()=>window.dispatchEvent(new Event('nodebase-open-upload')),80)}} ping={ping}/>}
       {page==='bots'&&<BotsPage setBot={id=>{setCurrentBotId(id);setPage('console');setBotTab('console')}} ping={ping}/>}
       {page==='files'&&<FilesPage ping={ping}/>}
+      {page==='watch'&&<WatchPage api={API} ping={ping} onUpload={()=>{setPage('files');window.setTimeout(()=>window.dispatchEvent(new Event('nodebase-open-upload')),80)}}/>}
       {page==='nodes'&&<NodesPage ping={ping}/>}
       {page==='console'&&currentBotId&&<BotWorkspace botId={currentBotId} initialTab={botTab} setTab={setBotTab} back={()=>setPage('bots')} ping={ping}/>}
       {page==='console'&&!currentBotId&&<BotsPage setBot={id=>{setCurrentBotId(id);setBotTab('console')}} ping={ping}/>}
@@ -107,6 +112,7 @@ function Sidebar({page,setPage,open,setOpen,collapsed,setCollapsed,setBotId}:{pa
     {label:'WORKSPACE',items:[{id:'overview' as Page,label:'Overview',icon:LayoutDashboard}]},
     {label:'HOSTING',items:[{id:'bots' as Page,label:'Bots',icon:Bot},{id:'nodes' as Page,label:'Nodes',icon:Server},{id:'backups' as Page,label:'Backups',icon:Archive}]},
     {label:'PERSONAL',items:[{id:'files' as Page,label:'Cloud',icon:Cloud}]},
+    {label:'SOCIAL',items:[{id:'watch' as Page,label:'Watch',icon:PlayCircle}]},
     {label:'SYSTEM',items:[{id:'activity' as Page,label:'Activity',icon:Activity},{id:'settings' as Page,label:'Settings',icon:Settings}]},
   ];
   return <><div className={`sidebar-backdrop ${open?'visible':''}`} onClick={()=>setOpen(false)}></div><aside className={`sidebar ${open?'mobile-open':''} ${collapsed?'collapsed':''}`}>

@@ -1,10 +1,10 @@
-# NODEBASE V3 — Development Branch
+# NODEBASE V3 — Watch Feature Branch
 
 **Build. Debug. Deploy. Organize. Connect.**
 
-This branch (`feat/nodebase-v3-workspace`) begins the V3 design-system and workspace migration using the approved V2 multi-node foundation. The current increment implements the Obsidian + Acid Lime tokens, balanced layout primitives, and System/Light/Dark theme behavior. Existing V2 hosting, nodes, bot workspaces, backups, activity, and Cloud screens are retained as the functional baseline while V3 modules are implemented incrementally.
+This branch (`feat/nodebase-watch`) is based on the V3 Obsidian + Acid Lime workspace foundation (`feat/nodebase-v3-workspace`) and approved V2 multi-node foundation. It retains the existing hosting, nodes, bot workspaces, backups, activity, Cloud screens, balanced layout primitives, and System/Light/Dark theme behavior.
 
-V3 AI Builder, NVIDIA provider workflows, Bug Hunter, Auto Fixer, Auto Setup, Notes, and Watch Together are not yet implemented in this source snapshot. See [`docs/v3/IMPLEMENTATION-STATUS.md`](docs/v3/IMPLEMENTATION-STATUS.md) and [`docs/v3/ROADMAP.md`](docs/v3/ROADMAP.md). Do not treat this branch as a production-complete V3 release.
+The Watch increment adds a Watch alpha: Cloud-backed MP4/WebM library discovery, private and discoverable-private rooms, hashed invitations, room-scoped guest sessions, progressive byte-range playback, server-stored playback state, room chat, and queue foundations. HLS transcoding, resumable multipart uploads, authenticated segment delivery, WebSocket synchronization, and production media analytics are not yet implemented. See [`docs/watch/IMPLEMENTATION-STATUS.md`](docs/watch/IMPLEMENTATION-STATUS.md), [`docs/watch/PRD.md`](docs/watch/PRD.md), and [`docs/watch/ARCHITECTURE.md`](docs/watch/ARCHITECTURE.md). AI Builder, NVIDIA provider workflows, Bug Hunter, Auto Fixer, Auto Setup, and Notes remain future V3 modules. This branch is not a production-complete streaming release.
 
 **Existing foundation:** A self-hosted Discord bot workspace and private file cloud. The current implementation uses a React dashboard, Fastify API, SQLite metadata, private disk-backed file objects, and a separate authenticated Docker runner.
 

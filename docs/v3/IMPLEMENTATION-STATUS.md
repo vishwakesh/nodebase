@@ -2,7 +2,7 @@
 
 ## Current branch
 
-`feat/nodebase-v3-workspace`
+`feat/nodebase-watch` (based on `feat/nodebase-v3-workspace`)
 
 ## Base
 
@@ -37,7 +37,7 @@ The following V3 modules must not be represented as finished:
 - New Projects workspace and global command/search system.
 - New dedicated Cloud experience (beyond existing File Cloud).
 - Notes workspace.
-- NODEBASE Watch, media processing, HLS delivery and synchronized rooms.
+- NODEBASE Watch production streaming: the current alpha has progressive MP4/WebM playback, room metadata, guest invites/sessions and polling-based playback state; HLS processing, WebSocket synchronization, resumable uploads and production media delivery remain incomplete.
 - PostgreSQL production migration and V3 production deployment isolation.
 - Full V3 responsive navigation redesign.
 
@@ -45,9 +45,12 @@ The following V3 modules must not be represented as finished:
 
 - Repository and branch history inspected.
 - Existing package scripts and Compose topology inspected.
-- Frontend dependency directory is not present in this workspace.
-- Node.js and npm are available; global TypeScript compiler is available, but project dependencies (`react`, `vite`, React types, Fastify types, etc.) are not installed.
-- Docker CLI is not available in this workspace.
-- Full TypeScript build, frontend production build, Docker build and automated test suites have not been run in this increment.
+- Frontend/backend dependency directories are not present in this workspace.
+- Node.js and npm are available; the global TypeScript compiler is available.
+- Bounded npm dependency installation timed out while fetching packages.
+- The changed TypeScript/TSX files passed syntax transpilation; this is not a full typecheck.
+- WATCH SQL migrations and a SQLite smoke workflow passed; `PRAGMA foreign_key_check` returned no violations.
+- CSS structural check and `git diff --check` passed.
+- Full TypeScript build, frontend production build, Docker build and API test suite have not been run.
 
 Do not call this increment production-ready. Install dependencies in a network-enabled environment and run `npm run typecheck`, `npm run build`, and `npm test` before deployment.

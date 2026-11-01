@@ -68,7 +68,7 @@ app.addHook('onRequest', async (request, reply) => {
   if (!['GET', 'HEAD', 'OPTIONS'].includes(request.method) && !csrfOk(request)) {
     return reply.code(403).send({ error: { code: 'CSRF_INVALID', message: 'Security token missing or expired. Refresh the page and try again.' } });
   }
-  if (publicPaths.has(pathname) || request.method === 'OPTIONS') return;
+  if (publicPaths.has(pathname) || pathname === '/api/watch/invitations/resolve' || pathname === '/api/watch/invitations/join' || pathname.startsWith('/api/watch/guest/') || request.method === 'OPTIONS') return;
   const token = request.cookies[SESSION_COOKIE];
   if (!token) return reply.code(401).send({ error: { code: 'UNAUTHENTICATED', message: 'Please sign in to continue.' } });
   const session = db.prepare(`SELECT s.id as session_id, s.expires_at, a.id, a.username, a.email, a.display_name
@@ -728,6 +728,236 @@ app.put('/api/settings/password', async (request) => {
   if(!await verifyPassword(body.currentPassword,admin.password_hash)) throw Object.assign(new Error('Current password is incorrect.'),{statusCode:401});
   const hash=await hashPassword(body.newPassword); db.prepare('UPDATE admin SET password_hash=? WHERE id=?').run(hash,request.admin!.id); db.prepare('DELETE FROM sessions WHERE user_id=? AND id<>?').run(request.admin!.id,request.sessionId); addActivity('security','Administrator changed password'); return {ok:true};
 });
+
+// NODEBASE WATCH alpha: private Cloud-backed MP4/WebM rooms with range streaming and server-authoritative playback.
+// HLS transcoding, WebSocket synchronization, and resumable chunk uploads remain separate follow-up milestones.
+const watchCookieName = (roomId: string) => `nb_watch_${roomId.replace(/-/g, '')}`;
+function requireWatchRoom(roomId: string) {
+  const room = db.prepare('SELECT * FROM watch_rooms WHERE id=?').get(roomId) as any;
+  if (!room) throw notFound('Watch room not found.');
+  return room;
+}
+function requireWatchOwner(roomId: string, userId: string) {
+  const room = requireWatchRoom(roomId);
+  if (room.owner_id !== userId) throw forbidden('Only the room host can perform this action.');
+  return room;
+}
+function requireWatchGuest(roomId: string, request: FastifyRequest, allowPending = false) {
+  const token = request.cookies[watchCookieName(roomId)];
+  if (!token) throw Object.assign(new Error('Join this room using a valid invitation.'), { statusCode: 401 });
+  const participant = db.prepare(`SELECT * FROM watch_participants WHERE room_id=? AND session_hash=? AND status IN ('joined','pending')`).get(roomId, sha256(token)) as any;
+  if (!participant) throw Object.assign(new Error('Your room access has expired or was revoked.'), { statusCode: 401 });
+  if (!allowPending && participant.status !== 'joined') throw Object.assign(new Error('Your request is waiting for host approval.'), { statusCode: 403 });
+  db.prepare('UPDATE watch_participants SET last_seen_at=? WHERE id=?').run(nowIso(), participant.id);
+  return participant;
+}
+function requireWatchMember(roomId: string, request: FastifyRequest, allowPending = false) {
+  const room = requireWatchRoom(roomId);
+  let participant: any = null;
+  if (request.admin) {
+    participant = db.prepare(`SELECT * FROM watch_participants WHERE room_id=? AND user_id=? AND status IN ('joined','pending')`).get(roomId, request.admin.id) as any;
+    if (!participant && room.owner_id === request.admin.id) throw forbidden('Host membership is missing.');
+  } else {
+    return requireWatchGuest(roomId, request, allowPending);
+  }
+  if (!participant) throw forbidden('You are not a participant in this watch room.');
+  if (!allowPending && participant.status !== 'joined') throw Object.assign(new Error('Your request is waiting for host approval.'), { statusCode: 403 });
+  db.prepare('UPDATE watch_participants SET last_seen_at=? WHERE id=?').run(nowIso(), participant.id);
+  return participant;
+}
+function watchSnapshot(roomId: string, viewer?: { userId?: string; role?: string }) {
+  const room = requireWatchRoom(roomId);
+  const viewerRole = viewer?.role ?? (viewer?.userId ? (db.prepare('SELECT role FROM watch_participants WHERE room_id=? AND user_id=? AND status=\'joined\'').get(roomId, viewer.userId) as any)?.role : undefined);
+  const isHost = viewer?.userId === room.owner_id || viewerRole === 'host';
+  const canControl = isHost || viewerRole === 'cohost' || Boolean(room.viewer_control_enabled);
+  const video = db.prepare('SELECT id,name,size,mime_type,created_at FROM files WHERE id=?').get(room.current_video_file_id) as any;
+  const participants = db.prepare(`SELECT id,display_name,role,status,joined_at,last_seen_at FROM watch_participants WHERE room_id=? AND status IN ('joined','pending') ORDER BY CASE role WHEN 'host' THEN 0 WHEN 'cohost' THEN 1 ELSE 2 END, joined_at`).all(roomId);
+  const queue = db.prepare(`SELECT q.id,q.position,q.created_at,f.id AS file_id,f.name,f.size,f.mime_type FROM watch_queue_items q JOIN files f ON f.id=q.file_id WHERE q.room_id=? ORDER BY q.position`).all(roomId);
+  const messages = db.prepare(`SELECT m.id,m.body,m.created_at,p.display_name,p.role FROM watch_messages m JOIN watch_participants p ON p.id=m.participant_id WHERE m.room_id=? AND m.deleted_at IS NULL ORDER BY m.created_at DESC LIMIT 50`).all(roomId).reverse();
+  const elapsed = room.playback_state === 'playing' ? Math.max(0, Date.now() - new Date(room.playback_updated_at).getTime()) : 0;
+  return {
+    room: { id:room.id,title:room.title,description:room.description,category:room.category,visibility:room.visibility,status:room.status,participantLimit:room.participant_limit,approvalRequired:Boolean(room.approval_required),chatEnabled:Boolean(room.chat_enabled),viewerControlEnabled:Boolean(room.viewer_control_enabled),createdAt:room.created_at },
+    video: video ? { id:video.id,name:video.name,size:video.size,mimeType:video.mime_type,delivery:'progressive',streamReady:true } : null,
+    playback: { state:room.playback_state,positionMs:room.playback_position_ms + (room.playback_state === 'playing' ? elapsed : 0),playbackRate:room.playback_rate,sequence:room.playback_sequence,serverTime:nowIso(),updatedAt:room.playback_updated_at },
+    participants,queue,messages,
+    permissions: { isHost, canControl, canInvite:isHost, canManageParticipants:isHost, canManageQueue:isHost },
+    mediaCapabilities: { progressiveMp4Webm:true,hls:false,websocketSync:false,resumableChunkUpload:false }
+  };
+}
+function sendWatchMedia(roomId: string, request: FastifyRequest, reply: FastifyReply) {
+  const room = requireWatchRoom(roomId);
+  if (room.status === 'ended' || room.status === 'expired') throw conflict('This watch room has ended.');
+  const file = db.prepare('SELECT * FROM files WHERE id=?').get(room.current_video_file_id) as any;
+  if (!file) throw notFound('The room video is no longer available.');
+  if (!['video/mp4','video/webm'].includes(file.mime_type)) throw Object.assign(new Error('The alpha player currently supports MP4 and WebM files. HLS processing is not enabled yet.'),{statusCode:415});
+  const target = blobPath(file.blob_name);
+  let stat: any;
+  try { stat = fs.statSync(target); } catch { throw notFound('Stored video content is missing.'); }
+  if (!stat.isFile() || stat.size <= 0) throw badRequest('The selected video file is empty or unavailable.');
+  const range = request.headers.range;
+  let start = 0; let end = stat.size - 1; let status = 200;
+  if (range) {
+    const match = /^bytes=(\d*)-(\d*)$/.exec(range.trim());
+    const unsatisfied = () => reply.code(416).header('Content-Range', `bytes */${stat.size}`).header('Accept-Ranges', 'bytes').send();
+    if (!match || (!match[1] && !match[2])) return unsatisfied();
+    if (!match[1]) {
+      const suffix = Number(match[2]);
+      if (!Number.isSafeInteger(suffix) || suffix <= 0) return unsatisfied();
+      start = Math.max(0, stat.size - suffix);
+    } else {
+      start = Number(match[1]);
+      if (!Number.isSafeInteger(start)) return unsatisfied();
+    }
+    if (match[2] && match[1]) {
+      const requestedEnd = Number(match[2]);
+      if (!Number.isSafeInteger(requestedEnd)) return unsatisfied();
+      end = Math.min(stat.size - 1, requestedEnd);
+    }
+    if (start >= stat.size || end < start) return unsatisfied();
+    status = 206;
+  }
+  reply.code(status).header('Accept-Ranges','bytes').header('Content-Type',file.mime_type).header('Content-Length',end-start+1).header('Content-Disposition',`inline; filename*=UTF-8''${encodeURIComponent(file.name)}`).header('Cache-Control','private, no-store').header('X-Content-Type-Options','nosniff');
+  if (status === 206) reply.header('Content-Range',`bytes ${start}-${end}/${stat.size}`);
+  return reply.send(fs.createReadStream(target,{start,end}));
+}
+const watchRoomCreateSchema = z.object({ title:z.string().trim().min(2).max(100),description:z.string().trim().max(500).default(''),category:z.string().trim().min(1).max(40).default('General'),videoFileId:z.string().uuid(),visibility:z.enum(['private','discoverable_private']).default('private'),participantLimit:z.number().int().min(2).max(50).default(12),approvalRequired:z.boolean().default(false),chatEnabled:z.boolean().default(true),viewerControlEnabled:z.boolean().default(false) });
+app.get('/api/watch/overview', async (request) => {
+  const videos = db.prepare(`SELECT id,name,size,mime_type,created_at,updated_at FROM files WHERE mime_type IN ('video/mp4','video/webm') ORDER BY updated_at DESC LIMIT 200`).all();
+  const rooms = db.prepare(`SELECT r.id,r.title,r.description,r.visibility,r.status,r.created_at,r.updated_at,f.name AS video_name,(SELECT COUNT(*) FROM watch_participants p WHERE p.room_id=r.id AND p.status='joined') AS participant_count FROM watch_rooms r JOIN files f ON f.id=r.current_video_file_id WHERE r.owner_id=? AND r.status<>'ended' ORDER BY r.updated_at DESC LIMIT 100`).all(request.admin!.id);
+  return { videos,rooms,capabilities:{progressiveStreaming:true,hls:false,websocketSync:false,resumableChunkUpload:false,liveBroadcasting:false} };
+});
+app.get('/api/watch/discovery', async (request) => ({ rooms:db.prepare(`SELECT r.id,r.title,r.description,r.category,r.status,r.created_at,r.approval_required,a.display_name AS host_name,(SELECT COUNT(*) FROM watch_participants p WHERE p.room_id=r.id AND p.status='joined') AS participant_count,(SELECT p.status FROM watch_participants p WHERE p.room_id=r.id AND p.user_id=? LIMIT 1) AS my_status FROM watch_rooms r JOIN admin a ON a.id=r.owner_id WHERE r.visibility='discoverable_private' AND r.status IN ('waiting','playing','paused') AND r.owner_id<>? ORDER BY r.created_at DESC LIMIT 100`).all(request.admin!.id,request.admin!.id) }));
+app.post('/api/watch/discovery/:id/request', async (request,reply) => {
+  const {id}=request.params as {id:string};const room=requireWatchRoom(id);
+  if(room.visibility!=='discoverable_private'||room.status==='ended'||room.status==='expired')throw notFound('This room is not discoverable.');
+  if(room.owner_id===request.admin!.id)throw conflict('You already host this room.');
+  const result=db.transaction(()=>{
+    const fresh=requireWatchRoom(id);
+    if(fresh.visibility!=='discoverable_private'||fresh.status==='ended'||fresh.status==='expired')throw notFound('This room is not discoverable.');
+    const existing=db.prepare(`SELECT * FROM watch_participants WHERE room_id=? AND user_id=?`).get(id,request.admin!.id) as any;
+    if(existing&&existing.status==='joined')return {status:'joined' as const,created:false,message:'You already have access to this room.'};
+    if(existing&&existing.status==='pending')return {status:'pending' as const,created:false,message:'Your access request is already awaiting approval.'};
+    const count=(db.prepare(`SELECT COUNT(*) AS n FROM watch_participants WHERE room_id=? AND status IN ('joined','pending')`).get(id) as any).n;
+    if(count>=fresh.participant_limit)throw conflict('This room has reached its participant limit.');
+    const status=fresh.approval_required?'pending' as const:'joined' as const;const now=nowIso();
+    if(existing) db.prepare(`UPDATE watch_participants SET display_name=?,role='viewer',status=?,joined_at=?,last_seen_at=?,left_at=NULL,session_hash=NULL WHERE id=?`).run(request.admin!.display_name,status,now,now,existing.id);
+    else db.prepare(`INSERT INTO watch_participants (id,room_id,user_id,display_name,role,status,joined_at,last_seen_at) VALUES (?,?,?,?,'viewer',?,?,?)`).run(randomUUID(),id,request.admin!.id,request.admin!.display_name,status,now,now);
+    return {status,created:!existing,message:status==='pending'?'Your request was sent to the host.':'You joined the room.'};
+  })();
+  addActivity('watch',result.status==='pending'?'Requested access to a watch room':'Joined a discoverable watch room',{roomId:id});
+  return reply.code(result.created?201:200).send({status:result.status,message:result.message});
+});
+
+app.post('/api/watch/rooms', async (request, reply) => {
+  const body=parseBody(watchRoomCreateSchema,request.body);
+  const file=db.prepare(`SELECT id,name,mime_type FROM files WHERE id=?`).get(body.videoFileId) as any;
+  if(!file) throw notFound('Select a video from your Cloud library.');
+  if(!['video/mp4','video/webm'].includes(file.mime_type)) throw badRequest('WATCH alpha supports MP4 and WebM files only.');
+  const id=randomUUID(); const now=nowIso();
+  const create=db.transaction(()=>{
+    db.prepare(`INSERT INTO watch_rooms (id,owner_id,title,description,category,visibility,status,current_video_file_id,participant_limit,approval_required,chat_enabled,viewer_control_enabled,playback_state,playback_position_ms,playback_rate,playback_sequence,playback_updated_at,created_at,updated_at) VALUES (?,?,?,?,?,?,'waiting',?,?,?,?,?,'paused',0,1,0,?,?,?)`).run(id,request.admin!.id,body.title,body.description,body.category,body.visibility,body.videoFileId,body.participantLimit,body.approvalRequired?1:0,body.chatEnabled?1:0,body.viewerControlEnabled?1:0,now,now,now);
+    db.prepare(`INSERT INTO watch_participants (id,room_id,user_id,display_name,role,status,joined_at,last_seen_at) VALUES (?,?,?,?,'host','joined',?,?)`).run(randomUUID(),id,request.admin!.id,request.admin!.display_name,now,now);
+  });
+  create(); addActivity('watch','Created watch room',{roomId:id,videoFileId:body.videoFileId});
+  return reply.code(201).send(watchSnapshot(id,{userId:request.admin!.id,role:'host'}));
+});
+app.get('/api/watch/rooms', async (request) => ({ rooms:db.prepare(`SELECT r.id,r.title,r.description,r.category,r.visibility,r.status,r.created_at,r.updated_at,f.id AS video_file_id,f.name AS video_name,(SELECT COUNT(*) FROM watch_participants p WHERE p.room_id=r.id AND p.status='joined') AS participant_count FROM watch_rooms r JOIN files f ON f.id=r.current_video_file_id WHERE r.owner_id=? ORDER BY r.updated_at DESC`).all(request.admin!.id) }));
+app.get('/api/watch/rooms/:id', async (request) => { const {id}=request.params as {id:string}; const participant=requireWatchMember(id,request); return watchSnapshot(id,{userId:request.admin?.id,role:participant.role}); });
+app.post('/api/watch/rooms/:id/invitations', async (request,reply) => {
+  const {id}=request.params as {id:string}; requireWatchOwner(id,request.admin!.id);
+  const body=parseBody(z.object({expiresInHours:z.number().int().min(1).max(168).default(24),maxUses:z.number().int().min(1).max(500).default(20)}),request.body);
+  const token=randomToken(32); const inviteId=randomUUID(); const created=nowIso(); const expires=new Date(Date.now()+body.expiresInHours*3600000).toISOString();
+  db.prepare('INSERT INTO watch_invitations (id,room_id,token_hash,created_by,expires_at,max_uses,created_at) VALUES (?,?,?,?,?,?,?)').run(inviteId,id,sha256(token),request.admin!.id,expires,body.maxUses,created);
+  addActivity('watch','Created a watch invitation',{roomId:id,invitationId:inviteId,expiresAt:expires});
+  return reply.code(201).send({invitation:{id:inviteId,token,expiresAt:expires,maxUses:body.maxUses}});
+});
+app.delete('/api/watch/invitations/:id', async (request,reply) => {
+  const {id}=request.params as {id:string}; const invite=db.prepare('SELECT i.*,r.owner_id FROM watch_invitations i JOIN watch_rooms r ON r.id=i.room_id WHERE i.id=?').get(id) as any;
+  if(!invite) throw notFound('Invitation not found.'); if(invite.owner_id!==request.admin!.id) throw forbidden('Only the room host can revoke this invitation.');
+  db.prepare('UPDATE watch_invitations SET revoked_at=? WHERE id=? AND revoked_at IS NULL').run(nowIso(),id); addActivity('watch','Revoked a watch invitation',{invitationId:id}); return reply.code(204).send();
+});
+function findWatchInvite(token:string) {
+  const invite=db.prepare(`SELECT i.*,r.title,r.description,r.status,r.visibility,r.participant_limit,r.approval_required,a.display_name AS host_name FROM watch_invitations i JOIN watch_rooms r ON r.id=i.room_id JOIN admin a ON a.id=r.owner_id WHERE i.token_hash=?`).get(sha256(token)) as any;
+  if(!invite || invite.revoked_at || invite.expires_at<=nowIso() || invite.used_count>=invite.max_uses || invite.status==='ended' || invite.status==='expired') throw notFound('This invitation is invalid, expired, revoked or already used up.');
+  return invite;
+}
+const watchInviteTokenSchema = z.string().min(40).max(200);
+app.post('/api/watch/invitations/resolve', {config:{rateLimit:{max:30,timeWindow:'1 minute'}}}, async (request) => {
+  const body=parseBody(z.object({token:watchInviteTokenSchema}),request.body);
+  const i=findWatchInvite(body.token);
+  const count=(db.prepare(`SELECT COUNT(*) AS n FROM watch_participants WHERE room_id=? AND status IN ('joined','pending')`).get(i.room_id) as any).n;
+  if(count>=i.participant_limit) throw conflict('This watch room has reached its participant limit.');
+  return {room:{id:i.room_id,title:i.title,description:i.description,hostName:i.host_name,visibility:i.visibility,participantCount:count,participantLimit:i.participant_limit,approvalRequired:Boolean(i.approval_required)}};
+});
+app.post('/api/watch/invitations/join', {config:{rateLimit:{max:10,timeWindow:'1 minute'}}}, async (request,reply) => {
+  const body=parseBody(z.object({token:watchInviteTokenSchema,displayName:z.string().trim().min(2).max(40)}),request.body);
+  const guestToken=randomToken(32); const participantId=randomUUID(); const now=nowIso();
+  // Re-check invitation validity and room capacity inside one transaction. This makes the
+  // max-use counter and participant reservation atomic even when multiple guests join together.
+  const joined=db.transaction(()=>{
+    const i=findWatchInvite(body.token);
+    const count=(db.prepare(`SELECT COUNT(*) AS n FROM watch_participants WHERE room_id=? AND status IN ('joined','pending')`).get(i.room_id) as any).n;
+    if(count>=i.participant_limit) throw conflict('This watch room has reached its participant limit.');
+    const reserved=db.prepare(`UPDATE watch_invitations SET used_count=used_count+1 WHERE id=? AND used_count<max_uses AND revoked_at IS NULL AND expires_at>?`).run(i.id,now);
+    if(!reserved.changes) throw notFound('This invitation is invalid, expired, revoked or already used up.');
+    const status=i.approval_required?'pending':'joined';
+    db.prepare(`INSERT INTO watch_participants (id,room_id,display_name,role,status,session_hash,joined_at,last_seen_at) VALUES (?,?,?,'viewer',?,?,?,?)`).run(participantId,i.room_id,body.displayName,status,sha256(guestToken),now,now);
+    return {roomId:i.room_id,status};
+  })();
+  reply.setCookie(watchCookieName(joined.roomId),guestToken,{httpOnly:true,secure:config.nodeEnv==='production',sameSite:'lax',path:`/api/watch/guest/${joined.roomId}`,maxAge:24*60*60});
+  if(joined.status==='joined') addActivity('watch','A guest joined a watch room',{roomId:joined.roomId,participantId});
+  return reply.code(201).send({roomId:joined.roomId,participantId,status:joined.status,message:joined.status==='pending'?'Your request is waiting for host approval.':'You joined the watch room.'});
+});
+app.post('/api/watch/rooms/:id/participants/:participantId/approve', async (request) => {
+  const {id,participantId}=request.params as {id:string;participantId:string}; requireWatchOwner(id,request.admin!.id);
+  const result=db.prepare(`UPDATE watch_participants SET status='joined',last_seen_at=? WHERE id=? AND room_id=? AND status='pending'`).run(nowIso(),participantId,id);
+  if(!result.changes) throw notFound('Pending participant not found.'); addActivity('watch','Approved a watch room participant',{roomId:id,participantId}); return {ok:true};
+});
+app.delete('/api/watch/rooms/:id/participants/:participantId', async (request,reply) => {
+  const {id,participantId}=request.params as {id:string;participantId:string}; requireWatchOwner(id,request.admin!.id);
+  const result=db.prepare(`UPDATE watch_participants SET status='removed',session_hash=NULL,left_at=? WHERE id=? AND room_id=? AND role<>'host' AND status IN ('joined','pending')`).run(nowIso(),participantId,id);
+  if(!result.changes) throw notFound('Removable participant not found.'); return reply.code(204).send();
+});
+function applyWatchPlayback(roomId:string,body:{action:'play'|'pause'|'seek'|'end';positionMs?:number;playbackRate?:number}) {
+  const room=requireWatchRoom(roomId); if(room.status==='ended'||room.status==='expired') throw conflict('This room has ended.');
+  const now=nowIso(); const position=Math.max(0,Math.min(7*24*60*60*1000,Math.floor(body.positionMs??room.playback_position_ms)));
+  const state=body.action==='play'?'playing':body.action==='pause'?'paused':body.action==='end'?'ended':room.playback_state; const sequence=room.playback_sequence+1;
+  const tx=db.transaction(()=>{
+    db.prepare(`UPDATE watch_rooms SET playback_state=?,playback_position_ms=?,playback_rate=?,playback_sequence=?,playback_updated_at=?,status=?,updated_at=?,ended_at=? WHERE id=?`).run(state,position,body.playbackRate??room.playback_rate,sequence,now,body.action==='end'?'ended':state,now,body.action==='end'?now:null,roomId);
+    db.prepare('INSERT INTO watch_room_events (id,room_id,sequence,event_type,payload_json,created_at) VALUES (?,?,?,?,?,?)').run(randomUUID(),roomId,sequence,body.action,JSON.stringify({positionMs:position,playbackRate:body.playbackRate??room.playback_rate}),now);
+  }); tx(); return {state,positionMs:position,playbackRate:body.playbackRate??room.playback_rate,sequence,serverTime:now};
+}
+const playbackSchema=z.object({action:z.enum(['play','pause','seek','end']),positionMs:z.number().int().min(0).max(7*24*60*60*1000).optional(),playbackRate:z.number().min(0.5).max(2).optional()});
+app.get('/api/watch/rooms/:id/playback',async(request)=>{const {id}=request.params as {id:string};requireWatchMember(id,request);return {playback:watchSnapshot(id).playback};});
+app.post('/api/watch/rooms/:id/playback',async(request)=>{const {id}=request.params as {id:string};const participant=requireWatchMember(id,request);const room=requireWatchRoom(id);if(participant.role!=='host'&&participant.role!=='cohost'&&!room.viewer_control_enabled)throw forbidden('Only the host can control synchronized playback.');const b=parseBody(playbackSchema,request.body);return {playback:applyWatchPlayback(id,b)};});
+app.get('/api/watch/rooms/:id/media',async(request,reply)=>{const {id}=request.params as {id:string};requireWatchMember(id,request);return sendWatchMedia(id,request,reply);});
+app.get('/api/watch/rooms/:id/messages',async(request)=>{const {id}=request.params as {id:string};requireWatchMember(id,request);return {messages:watchSnapshot(id).messages};});
+app.post('/api/watch/rooms/:id/messages',async(request,reply)=>{
+  const {id}=request.params as {id:string};const participant=requireWatchMember(id,request);const room=requireWatchRoom(id);if(!room.chat_enabled)throw forbidden('Room chat is disabled.');
+  const body=parseBody(z.object({body:z.string().trim().min(1).max(1000)}),request.body);const created=nowIso();const mid=randomUUID();db.prepare('INSERT INTO watch_messages (id,room_id,participant_id,body,created_at) VALUES (?,?,?,?,?)').run(mid,id,participant.id,body.body,created);return reply.code(201).send({message:{id:mid,body:body.body,display_name:participant.display_name,role:participant.role,created_at:created}});
+});
+app.post('/api/watch/rooms/:id/leave',async(request)=>{const {id}=request.params as {id:string};const participant=requireWatchMember(id,request);if(participant.role==='host')throw conflict('The host must end the room instead of leaving it.');db.prepare(`UPDATE watch_participants SET status='left',session_hash=NULL,left_at=? WHERE id=? AND room_id=?`).run(nowIso(),participant.id,id);return {ok:true};});
+app.get('/api/watch/guest/:id',async(request)=>{
+  const {id}=request.params as {id:string};const participant=requireWatchGuest(id,request,true);const room=requireWatchRoom(id);
+  if(participant.status==='pending')return {status:'pending',room:{id,title:room.title,description:room.description},message:'Waiting for the host to approve your request.'};
+  return {status:'joined',...watchSnapshot(id,{role:participant.role}),participant:{id:participant.id,displayName:participant.display_name,role:participant.role}};
+});
+app.get('/api/watch/guest/:id/playback',async(request)=>{const {id}=request.params as {id:string};requireWatchGuest(id,request);return {playback:watchSnapshot(id).playback};});
+app.post('/api/watch/guest/:id/playback',async(request)=>{
+  const {id}=request.params as {id:string};const participant=requireWatchGuest(id,request);const room=requireWatchRoom(id);if(participant.role!=='host'&&participant.role!=='cohost'&&!room.viewer_control_enabled)throw forbidden('Only the host can control synchronized playback.');const body=parseBody(playbackSchema,request.body);return {playback:applyWatchPlayback(id,body)};
+});
+app.get('/api/watch/guest/:id/media',async(request,reply)=>{const {id}=request.params as {id:string};requireWatchGuest(id,request);return sendWatchMedia(id,request,reply);});
+app.get('/api/watch/guest/:id/messages',async(request)=>{const {id}=request.params as {id:string};requireWatchGuest(id,request);return {messages:watchSnapshot(id).messages};});
+app.post('/api/watch/guest/:id/messages',async(request,reply)=>{
+  const {id}=request.params as {id:string};const participant=requireWatchGuest(id,request);const room=requireWatchRoom(id);if(!room.chat_enabled)throw forbidden('Room chat is disabled.');const body=parseBody(z.object({body:z.string().trim().min(1).max(1000)}),request.body);const messageId=randomUUID();const created=nowIso();db.prepare('INSERT INTO watch_messages (id,room_id,participant_id,body,created_at) VALUES (?,?,?,?,?)').run(messageId,id,participant.id,body.body,created);return reply.code(201).send({message:{id:messageId,body:body.body,display_name:participant.display_name,role:participant.role,created_at:created}});
+});
+app.get('/api/watch/guest/:id/queue',async(request)=>{const {id}=request.params as {id:string};requireWatchGuest(id,request);return {queue:watchSnapshot(id).queue};});
+app.post('/api/watch/guest/:id/leave',async(request,reply)=>{const {id}=request.params as {id:string};const participant=requireWatchGuest(id,request,true);db.prepare(`UPDATE watch_participants SET status='left',session_hash=NULL,left_at=? WHERE id=? AND room_id=?`).run(nowIso(),participant.id,id);reply.clearCookie(watchCookieName(id),{path:`/api/watch/guest/${id}`});return {ok:true};});
+app.post('/api/watch/rooms/:id/queue',async(request,reply)=>{
+  const {id}=request.params as {id:string};requireWatchOwner(id,request.admin!.id);const body=parseBody(z.object({fileId:z.string().uuid()}),request.body);const file=db.prepare(`SELECT id,name,mime_type FROM files WHERE id=?`).get(body.fileId) as any;if(!file||!['video/mp4','video/webm'].includes(file.mime_type))throw badRequest('Choose an MP4 or WebM video from Cloud.');const position=(db.prepare('SELECT COALESCE(MAX(position),0)+1 AS p FROM watch_queue_items WHERE room_id=?').get(id) as any).p;const itemId=randomUUID();db.prepare('INSERT INTO watch_queue_items (id,room_id,file_id,added_by,position,created_at) VALUES (?,?,?,?,?,?)').run(itemId,id,file.id,request.admin!.id,position,nowIso());return reply.code(201).send({item:{id:itemId,position,file_id:file.id,name:file.name,size:0,mime_type:file.mime_type}});
+});
+app.delete('/api/watch/rooms/:id/queue/:itemId',async(request,reply)=>{const {id,itemId}=request.params as {id:string;itemId:string};requireWatchOwner(id,request.admin!.id);const result=db.prepare('DELETE FROM watch_queue_items WHERE id=? AND room_id=?').run(itemId,id);if(!result.changes)throw notFound('Queue item not found.');return reply.code(204).send();});
+app.post('/api/watch/rooms/:id/end',async(request)=>{const {id}=request.params as {id:string};requireWatchOwner(id,request.admin!.id);const now=nowIso();db.prepare(`UPDATE watch_rooms SET status='ended',playback_state='ended',ended_at=?,updated_at=?,playback_sequence=playback_sequence+1 WHERE id=?`).run(now,now,id);db.prepare('UPDATE watch_participants SET status=CASE WHEN status IN (\'joined\',\'pending\') THEN \'left\' ELSE status END,session_hash=NULL,left_at=? WHERE room_id=?').run(now,id);db.prepare('UPDATE watch_invitations SET revoked_at=? WHERE room_id=? AND revoked_at IS NULL').run(now,id);addActivity('watch','Ended a watch room',{roomId:id});return {ok:true};});
 
 // Serve the Vite build when deployed as a single container. In development, Vite serves the UI itself.
 if (fs.existsSync(path.join(config.staticDir,'index.html'))) {

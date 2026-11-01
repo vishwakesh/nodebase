@@ -8,10 +8,12 @@ let db: any;
 let cookie = '';
 let csrf = '';
 let storageRoot = '/tmp/nodebase-test-storage';
+let blobRoot = '/tmp/nodebase-test-storage/file-blobs';
 
 before(async () => {
   const configModule = await import('../src/config.js');
   storageRoot = configModule.config.storageRoot;
+  blobRoot = configModule.config.blobRoot;
   await fs.rm(storageRoot, { recursive: true, force: true });
   const server = await import('../src/server.js');
   app = server.app;
@@ -78,7 +80,7 @@ test('uploaded files stay private and can be downloaded through an authorized ro
 
 test('database schema is tracked through a versioned migration', () => {
   const applied = db.prepare('SELECT version FROM schema_migrations ORDER BY version').all().map((row: any) => row.version);
-  assert.deepEqual(applied, ['001_initial.sql', '002_nodes.sql']);
+  assert.deepEqual(applied, ['001_initial.sql', '002_nodes.sql', '003_watch.sql']);
 });
 
 
@@ -160,4 +162,126 @@ test('node enrollment tokens are single-use and agent heartbeats update real nod
     payload: { agentVersion: 'test-1', cpuPercent: 0, memoryTotalBytes: 1, memoryUsedBytes: 0, storageTotalBytes: 1, storageUsedBytes: 0, runtimes: ['node'] },
   });
   assert.equal(revokedHeartbeat.statusCode, 401);
+});
+
+
+test('WATCH creates private rooms, issues scoped invitations, joins guests, and streams byte ranges', async () => {
+  const { randomUUID } = await import('node:crypto');
+  const fileId = randomUUID();
+  const blobName = randomUUID();
+  const media = Buffer.from('0123456789abcdefghijklmnopqrstuvwxyz');
+  await fs.mkdir(blobRoot, { recursive: true });
+  await fs.writeFile(path.join(blobRoot, blobName), media);
+  db.prepare('INSERT INTO files (id,name,folder_id,blob_name,size,mime_type,created_at,updated_at) VALUES (?,?,NULL,?,?,?,?,?)')
+    .run(fileId, 'watch-sample.mp4', blobName, media.length, 'video/mp4', new Date().toISOString(), new Date().toISOString());
+
+  const created = await app.inject({
+    method: 'POST', url: '/api/watch/rooms',
+    headers: { cookie, 'x-csrf-token': csrf, 'content-type': 'application/json' },
+    payload: { title: 'Private test room', videoFileId: fileId, visibility: 'discoverable_private', participantLimit: 4 },
+  });
+  assert.equal(created.statusCode, 201, created.body);
+  const roomId = created.json().room.id;
+  assert.equal(created.json().video.delivery, 'progressive');
+  assert.equal(created.json().room.visibility, 'discoverable_private');
+
+  const invitation = await app.inject({
+    method: 'POST', url: `/api/watch/rooms/${roomId}/invitations`,
+    headers: { cookie, 'x-csrf-token': csrf, 'content-type': 'application/json' },
+    payload: { expiresInHours: 1, maxUses: 1 },
+  });
+  assert.equal(invitation.statusCode, 201, invitation.body);
+  const token = invitation.json().invitation.token;
+  assert.ok(token.length >= 40);
+  assert.equal(invitation.body.includes(token), true, 'raw token is returned once to the creator');
+  const stored = (db.prepare('SELECT token_hash FROM watch_invitations WHERE id=?').get(invitation.json().invitation.id) as any).token_hash;
+  assert.notEqual(stored, token, 'only token hash is persisted');
+  const unauthenticatedRevoke = await app.inject({ method: 'DELETE', url: `/api/watch/invitations/${invitation.json().invitation.id}`, headers: { cookie: `nb_csrf=${csrf}`, 'x-csrf-token': csrf } });
+  assert.equal(unauthenticatedRevoke.statusCode, 401, 'invitation revocation requires an authenticated room owner');
+
+  const preview = await app.inject({ method: 'POST', url: '/api/watch/invitations/resolve', headers: { cookie: `nb_csrf=${csrf}`, 'x-csrf-token': csrf, 'content-type': 'application/json' }, payload: { token } });
+  assert.equal(preview.statusCode, 200, preview.body);
+  assert.equal(preview.json().room.title, 'Private test room');
+
+  const joinAttempts = await Promise.all([1, 2].map((n) => app.inject({
+    method: 'POST', url: '/api/watch/invitations/join',
+    headers: { cookie: `nb_csrf=${csrf}`, 'x-csrf-token': csrf, 'content-type': 'application/json' },
+    payload: { token, displayName: `Guest Viewer ${n}` },
+  })));
+  const joined = joinAttempts.find((attempt: any) => attempt.statusCode === 201);
+  const rejectedJoin = joinAttempts.find((attempt: any) => attempt.statusCode !== 201);
+  assert.ok(joined, 'one concurrent join consumes the one-use invitation');
+  assert.equal(rejectedJoin?.statusCode, 404, 'the competing join cannot exceed max uses');
+  assert.equal(joined.json().status, 'joined');
+  const setCookies = joined.headers['set-cookie'];
+  const cookieValues = (Array.isArray(setCookies) ? setCookies : [setCookies]).filter(Boolean).map((value: string) => value.split(';')[0]);
+  const watchCookie = cookieValues.find((value: string) => value.startsWith('nb_watch_'));
+  assert.ok(watchCookie, 'guest receives a room-scoped HttpOnly cookie');
+  const guestCookie = `${cookie}; ${watchCookie}`;
+
+  const guestRoom = await app.inject({ method: 'GET', url: `/api/watch/guest/${roomId}`, headers: { cookie: guestCookie } });
+  assert.equal(guestRoom.statusCode, 200, guestRoom.body);
+  assert.match(guestRoom.json().participant.displayName, /^Guest Viewer [12]$/);
+
+  const hostPlayback = await app.inject({
+    method: 'POST', url: `/api/watch/rooms/${roomId}/playback`,
+    headers: { cookie, 'x-csrf-token': csrf, 'content-type': 'application/json' },
+    payload: { action: 'play', positionMs: 12500 },
+  });
+  assert.equal(hostPlayback.statusCode, 200, hostPlayback.body);
+  assert.equal(hostPlayback.json().playback.state, 'playing');
+
+  const guestPlayback = await app.inject({ method: 'GET', url: `/api/watch/guest/${roomId}/playback`, headers: { cookie: guestCookie } });
+  assert.equal(guestPlayback.statusCode, 200, guestPlayback.body);
+  assert.equal(guestPlayback.json().playback.state, 'playing');
+  const guestCannotControl = await app.inject({
+    method: 'POST', url: `/api/watch/guest/${roomId}/playback`,
+    headers: { cookie: guestCookie, 'x-csrf-token': csrf, 'content-type': 'application/json' },
+    payload: { action: 'pause', positionMs: 12500 },
+  });
+  assert.equal(guestCannotControl.statusCode, 403, 'ordinary guests cannot change the host-controlled timeline');
+
+  const mediaRange = await app.inject({ method: 'GET', url: `/api/watch/guest/${roomId}/media`, headers: { cookie: guestCookie, range: 'bytes=0-4' } });
+  assert.equal(mediaRange.statusCode, 206, mediaRange.body);
+  assert.equal(mediaRange.body, '01234');
+  assert.equal(mediaRange.headers['content-range'], `bytes 0-4/${media.length}`);
+  const invalidRange = await app.inject({ method: 'GET', url: `/api/watch/guest/${roomId}/media`, headers: { cookie: guestCookie, range: 'bytes=-0' } });
+  assert.equal(invalidRange.statusCode, 416, 'zero-length suffix ranges are rejected');
+
+  const unauthenticatedMedia = await app.inject({ method: 'GET', url: `/api/watch/guest/${roomId}/media` });
+  assert.equal(unauthenticatedMedia.statusCode, 401);
+
+  const replay = await app.inject({ method: 'POST', url: '/api/watch/invitations/resolve', headers: { cookie: `nb_csrf=${csrf}`, 'x-csrf-token': csrf, 'content-type': 'application/json' }, payload: { token } });
+  assert.equal(replay.statusCode, 404, 'single-use invitation is no longer valid');
+  const leave = await app.inject({ method: 'POST', url: `/api/watch/guest/${roomId}/leave`, headers: { cookie: guestCookie, 'x-csrf-token': csrf, 'content-type': 'application/json' }, payload: {} });
+  assert.equal(leave.statusCode, 200);
+  const afterLeave = await app.inject({ method: 'GET', url: `/api/watch/guest/${roomId}`, headers: { cookie: guestCookie } });
+  assert.equal(afterLeave.statusCode, 401, 'leaving revokes the room-scoped guest session');
+});
+
+test('WATCH discovery lists only other hosts’ discoverable-private rooms', async () => {
+  const { randomUUID } = await import('node:crypto');
+  const otherOwnerId = randomUUID();
+  const now = new Date().toISOString();
+  db.prepare('INSERT INTO admin (id,username,email,display_name,password_hash,created_at) VALUES (?,?,?,?,?,?)')
+    .run(otherOwnerId, 'watchhost', 'watchhost@example.test', 'Watch Host', 'unused-test-hash', now);
+  const video = db.prepare(`SELECT id FROM files WHERE mime_type='video/mp4' ORDER BY created_at DESC LIMIT 1`).get() as any;
+  assert.ok(video, 'WATCH test video exists');
+
+  const discoverableId = randomUUID();
+  db.prepare(`INSERT INTO watch_rooms (id,owner_id,title,description,category,visibility,status,current_video_file_id,participant_limit,approval_required,chat_enabled,viewer_control_enabled,playback_state,playback_position_ms,playback_rate,playback_sequence,playback_updated_at,created_at,updated_at) VALUES (?,?,?,'','General','discoverable_private','waiting',?,12,1,1,0,'paused',0,1,0,?,?,?)`)
+    .run(discoverableId, otherOwnerId, 'Discoverable test room', video.id, now, now, now);
+  db.prepare(`INSERT INTO watch_participants (id,room_id,user_id,display_name,role,status,joined_at,last_seen_at) VALUES (?,?,?,'Watch Host','host','joined',?,?)`)
+    .run(randomUUID(), discoverableId, otherOwnerId, now, now);
+
+  const privateId = randomUUID();
+  db.prepare(`INSERT INTO watch_rooms (id,owner_id,title,description,category,visibility,status,current_video_file_id,participant_limit,approval_required,chat_enabled,viewer_control_enabled,playback_state,playback_position_ms,playback_rate,playback_sequence,playback_updated_at,created_at,updated_at) VALUES (?,?,?,'','General','private','waiting',?,12,0,1,0,'paused',0,1,0,?,?,?)`)
+    .run(privateId, otherOwnerId, 'Private hidden room', video.id, now, now, now);
+
+  const listed = await app.inject({ method: 'GET', url: '/api/watch/discovery', headers: { cookie } });
+  assert.equal(listed.statusCode, 200, listed.body);
+  assert.ok(listed.json().rooms.some((room: any) => room.id === discoverableId));
+  assert.ok(!listed.json().rooms.some((room: any) => room.id === privateId));
+  assert.ok(!listed.json().rooms.some((room: any) => room.title === 'Private test room'), 'the current owner does not see its own room in discovery');
+  assert.ok(listed.json().rooms.every((room: any) => !('invitationToken' in room) && !('videoPath' in room) && !('filePath' in room)));
 });
