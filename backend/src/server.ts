@@ -716,7 +716,7 @@ app.get('/api/activity', async (request) => {
 app.get('/api/settings', async (request) => {
   const values=Object.fromEntries((db.prepare('SELECT key,value FROM settings').all() as any[]).map(s=>[s.key,s.value]));
   const services=await getRunnerHealth(); const storage=db.prepare('SELECT COALESCE(SUM(size),0) AS bytes,COUNT(*) AS count FROM files').get() as any;
-  return { profile:{id:request.admin!.id,username:request.admin!.username,email:request.admin!.email,displayName:request.admin!.display_name},preferences:{theme:values.theme??'light'},storage:{usedBytes:storage.bytes,limitBytes:config.maxStorageBytes,fileCount:storage.count},services:{api:true,database:true,runner:services.connected,runnerMessage:services.message,encryptionKeyConfigured:Boolean(config.encryptionKey)} };
+  return { profile:{id:request.admin!.id,username:request.admin!.username,email:request.admin!.email,displayName:request.admin!.display_name},preferences:{theme:values.theme??'system'},storage:{usedBytes:storage.bytes,limitBytes:config.maxStorageBytes,fileCount:storage.count},services:{api:true,database:true,runner:services.connected,runnerMessage:services.message,encryptionKeyConfigured:Boolean(config.encryptionKey)} };
 });
 app.put('/api/settings/preferences', async (request) => {
   const body=parseBody(z.object({displayName:z.string().trim().min(1).max(80),theme:z.enum(['light','dark','system'])}),request.body); const now=nowIso();
