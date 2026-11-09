@@ -21,6 +21,7 @@ import { db, nowIso, addActivity } from './db.js';
 import { randomToken, sha256, safeEqual, hashPassword, verifyPassword, encryptSecret, decryptSecret, safeFilename, validEnvKey, validEntryPoint, resolveInside, isSafeSetupKey, securityCookieOptions, SESSION_COOKIE, CSRF_COOKIE } from './security.js';
 import { blobPath, backupPath, diskAvailableBytes, folderSize, safeExtractZip, createWorkspaceZip, copyTree, newBlobName } from './storage.js';
 import { getRunnerHealth, runner, RunnerUnavailableError } from './runner-client.js';
+import { EmailDeliveryUnavailableError, isEmailDeliveryConfigured, sendTransactionalEmail } from './mailer.js';
 
 if (config.nodeEnv === 'production') {
   const invalid: string[] = [];
@@ -30,7 +31,7 @@ if (config.nodeEnv === 'production') {
   if (invalid.length) throw new Error(`Unsafe NODEBASE production configuration: ${invalid.join(', ')}.`);
 }
 
-interface Admin { id: string; username: string; email: string; display_name: string; }
+interface Admin { id: string; username: string; email: string; display_name: string; platform_role: 'platform_admin' | 'member'; account_status: 'active' | 'suspended'; email_verified_at: string | null; }
 declare module 'fastify' {
   interface FastifyRequest { admin: Admin | null; sessionId: string | null; }
 }
@@ -54,7 +55,7 @@ await app.register(cors, {
 await app.register(rateLimit, { max: 180, timeWindow: '1 minute' });
 await app.register(multipart, { limits: { files: 1, fields: 12, parts: 16, fileSize: Math.max(config.maxFileBytes, config.maxBotUploadBytes) } });
 
-const publicPaths = new Set(['/api/health', '/api/auth/csrf', '/api/auth/setup-status', '/api/auth/setup', '/api/auth/login']);
+const publicPaths = new Set(['/api/health', '/api/auth/csrf', '/api/auth/setup-status', '/api/auth/setup', '/api/auth/login', '/api/auth/register', '/api/auth/verify-email', '/api/auth/resend-verification', '/api/auth/forgot-password', '/api/auth/reset-password']);
 function requestPath(request: FastifyRequest) { return request.url.split('?')[0]; }
 function csrfOk(request: FastifyRequest) {
   const cookieToken = request.cookies[CSRF_COOKIE];
@@ -71,15 +72,21 @@ app.addHook('onRequest', async (request, reply) => {
   if (publicPaths.has(pathname) || pathname === '/api/watch/invitations/resolve' || pathname === '/api/watch/invitations/join' || pathname.startsWith('/api/watch/guest/') || request.method === 'OPTIONS') return;
   const token = request.cookies[SESSION_COOKIE];
   if (!token) return reply.code(401).send({ error: { code: 'UNAUTHENTICATED', message: 'Please sign in to continue.' } });
-  const session = db.prepare(`SELECT s.id as session_id, s.expires_at, a.id, a.username, a.email, a.display_name
+  const session = db.prepare(`SELECT s.id as session_id, s.expires_at, a.id, a.username, a.email, a.display_name, a.platform_role, a.account_status, a.email_verified_at
     FROM sessions s JOIN admin a ON a.id=s.user_id WHERE s.token_hash=?`).get(sha256(token)) as (Admin & { session_id: string; expires_at: string }) | undefined;
   if (!session || session.expires_at <= nowIso()) {
     if (session) db.prepare('DELETE FROM sessions WHERE id=?').run(session.session_id);
     reply.clearCookie(SESSION_COOKIE, { path: '/' });
     return reply.code(401).send({ error: { code: 'SESSION_EXPIRED', message: 'Your session expired. Please sign in again.' } });
   }
-  request.admin = { id: session.id, username: session.username, email: session.email, display_name: session.display_name };
+  if (session.account_status !== 'active') return reply.code(403).send({ error: { code: 'ACCOUNT_SUSPENDED', message: 'This account is suspended. Contact the platform administrator.' } });
+  if (!session.email_verified_at) return reply.code(403).send({ error: { code: 'EMAIL_NOT_VERIFIED', message: 'Verify your email address before signing in.' } });
+  request.admin = { id: session.id, username: session.username, email: session.email, display_name: session.display_name, platform_role: session.platform_role, account_status: session.account_status, email_verified_at: session.email_verified_at };
   request.sessionId = session.session_id;
+  // V3 resource routes are deliberately unavailable to regular members until their data
+  // access paths enforce organization_id. This prevents cross-tenant leakage during rollout.
+  const memberSafePath = pathname === '/api/auth/session' || pathname === '/api/auth/logout' || pathname === '/api/auth/sessions' || pathname.startsWith('/api/auth/sessions/') || pathname === '/api/account' || pathname.startsWith('/api/account/') || pathname === '/api/organizations' || pathname.startsWith('/api/organizations/');
+  if (session.platform_role !== 'platform_admin' && !memberSafePath) return reply.code(403).send({ error: { code: 'V4_MODULE_NOT_READY', message: 'This resource module is being upgraded for organization-level access. Your account and organization are available.' } });
 });
 
 app.setErrorHandler((error, request, reply) => {
@@ -87,8 +94,10 @@ app.setErrorHandler((error, request, reply) => {
   if ((error as any).statusCode === 413 || error.message?.toLowerCase().includes('file too large')) return reply.code(413).send({ error: { code: 'UPLOAD_TOO_LARGE', message: 'The upload exceeds the configured file-size limit.' } });
   request.log.error({ err: error, requestId: request.id }, 'Request failed');
   const status = Number((error as any).statusCode) >= 400 && Number((error as any).statusCode) < 600 ? Number((error as any).statusCode) : 500;
-  const safeMessage = status >= 500 ? 'The server could not complete this request.' : error.message;
-  return reply.code(status).send({ error: { code: status === 500 ? 'INTERNAL_ERROR' : 'REQUEST_ERROR', message: safeMessage, requestId: request.id } });
+  const knownOperationalCode = ['EMAIL_UNAVAILABLE', 'EMAIL_DELIVERY_FAILED'].includes(String((error as any).code ?? ''));
+  const safeMessage = status >= 500 && !knownOperationalCode ? 'The server could not complete this request.' : error.message;
+  const code = typeof (error as any).code === 'string' ? (error as any).code : status === 500 ? 'INTERNAL_ERROR' : 'REQUEST_ERROR';
+  return reply.code(status).send({ error: { code, message: safeMessage, requestId: request.id } });
 });
 
 function parseBody<T>(schema: z.ZodType<T>, value: unknown): T {
@@ -145,7 +154,34 @@ app.get('/api/auth/csrf', async (_request, reply) => {
   return { csrfToken: token };
 });
 app.get('/api/auth/setup-status', async () => ({ setupRequired: (db.prepare('SELECT COUNT(*) AS c FROM admin').get() as any).c === 0, setupKeyConfigured: Boolean(config.setupKey) }));
-const setupSchema = z.object({ setupKey: z.string().min(1), username: z.string().min(3).max(40).regex(/^[a-zA-Z0-9_.-]+$/), email: z.string().email().max(254), displayName: z.string().min(1).max(80), password: z.string().min(12).max(128) });
+
+function createPersonalOrganization(userId: string, displayName: string, createdAt = nowIso()) {
+  const organizationId = `personal-${userId}`;
+  const slug = `personal-${userId.toLowerCase().replace(/[^a-z0-9]/g, '')}`;
+  db.prepare(`INSERT INTO organizations(id,name,slug,description,type,owner_user_id,created_at,updated_at)
+    VALUES(?,?,?,'','personal',?,?,?)`).run(organizationId, `${displayName.trim().slice(0, 68)} Workspace`, slug, userId, createdAt, createdAt);
+  db.prepare(`INSERT INTO organization_memberships(organization_id,user_id,role,status,joined_at,created_at,updated_at)
+    VALUES(?,?,'owner','active',?,?,?)`).run(organizationId, userId, createdAt, createdAt, createdAt);
+  return organizationId;
+}
+function auditPlatform(actorId: string | null, eventType: string, targetType?: string, targetId?: string, detail?: unknown) {
+  db.prepare(`INSERT INTO platform_audit_events(id,actor_user_id,event_type,target_type,target_id,detail_json,created_at) VALUES(?,?,?,?,?,?,?)`)
+    .run(randomUUID(), actorId, eventType, targetType ?? null, targetId ?? null, detail === undefined ? null : JSON.stringify(detail), nowIso());
+}
+function requireOrganizationMembership(organizationId: string, userId: string) {
+  const membership = db.prepare(`SELECT m.organization_id,m.user_id,m.role,m.status,o.name,o.slug,o.description,o.type,o.owner_user_id,o.created_at,o.updated_at
+    FROM organization_memberships m JOIN organizations o ON o.id=m.organization_id
+    WHERE m.organization_id=? AND m.user_id=?`).get(organizationId, userId) as any;
+  if (!membership || membership.status !== 'active') throw notFound('Organization not found.');
+  return membership;
+}
+function requireOrganizationRole(organizationId: string, userId: string, roles: string[]) {
+  const membership = requireOrganizationMembership(organizationId, userId);
+  if (!roles.includes(membership.role)) throw forbidden('Your organization role does not allow this action.');
+  return membership;
+}
+function safeEmailHtml(value: string) { const entities: Record<string,string> = {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}; return value.replace(/[&<>"']/g, (ch) => entities[ch]); }
+const setupSchema = z.object({ setupKey: z.string().min(1), username: z.string().min(3).max(40).regex(/^[a-zA-Z0-9_.-]+$/), email: z.string().email().max(254), displayName: z.string().min(1).max(80), password: z.string().min(12).max(128), passwordConfirmation: z.string().min(12).max(128).optional() }).refine(v => !v.passwordConfirmation || v.password === v.passwordConfirmation, { path: ['passwordConfirmation'], message: 'Passwords do not match.' });
 app.post('/api/auth/setup', { config: { rateLimit: { max: 5, timeWindow: '1 minute' } } }, async (request, reply) => {
   const body = parseBody(setupSchema, request.body);
   if (!isSafeSetupKey(body.setupKey)) throw forbidden('The one-time setup key is incorrect. Configure NODEBASE_SETUP_KEY on the server.');
@@ -154,7 +190,8 @@ app.post('/api/auth/setup', { config: { rateLimit: { max: 5, timeWindow: '1 minu
   try {
     const createAdmin = db.transaction(() => {
       if ((db.prepare('SELECT COUNT(*) AS c FROM admin').get() as any).c > 0) throw conflict('Initial setup has already been completed.');
-      db.prepare('INSERT INTO admin (id,username,email,display_name,password_hash,created_at) VALUES (?,?,?,?,?,?)').run(id, body.username, body.email, body.displayName, passwordHash, now);
+      db.prepare(`INSERT INTO admin (id,username,email,display_name,password_hash,created_at,platform_role,account_status,email_verified_at) VALUES (?,?,?,?,?,?,'platform_admin','active',?)`).run(id, body.username, body.email, body.displayName, passwordHash, now, now);
+      createPersonalOrganization(id, body.displayName, now);
     });
     createAdmin();
   } catch (error) {
@@ -163,7 +200,7 @@ app.post('/api/auth/setup', { config: { rateLimit: { max: 5, timeWindow: '1 minu
   }
   createSession(request, reply, id);
   addActivity('security', 'NODEBASE administrator created', { username: body.username });
-  return { user: { id, username: body.username, email: body.email, displayName: body.displayName } };
+  return { user: { id, username: body.username, email: body.email, displayName: body.displayName, platformRole: 'platform_admin' } };
 });
 function createSession(request: FastifyRequest, reply: FastifyReply, userId: string) {
   const token = randomToken(); const id = randomUUID(); const csrf = request.cookies[CSRF_COOKIE] ?? randomToken();
@@ -178,11 +215,13 @@ app.post('/api/auth/login', { config: { rateLimit: { max: 8, timeWindow: '1 minu
   const admin = db.prepare('SELECT * FROM admin WHERE username=? OR email=?').get(body.username, body.username) as any;
   const ok = admin ? await verifyPassword(body.password, admin.password_hash) : await verifyPassword(body.password, 'scrypt$MDEyMzQ1Njc4OWFiY2RlZg==$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==');
   if (!admin || !ok) throw Object.assign(new Error('Invalid username/email or password.'), { statusCode: 401 });
+  if (admin.account_status !== 'active') throw forbidden('This account is suspended. Contact the platform administrator.');
+  if (!admin.email_verified_at) throw forbidden('Verify your email address before signing in.');
   createSession(request, reply, admin.id);
   addActivity('security', 'Administrator signed in', { username: admin.username });
-  return { user: { id: admin.id, username: admin.username, email: admin.email, displayName: admin.display_name } };
+  return { user: { id: admin.id, username: admin.username, email: admin.email, displayName: admin.display_name, platformRole: admin.platform_role } };
 });
-app.get('/api/auth/session', async (request) => ({ user: request.admin ? { id: request.admin.id, username: request.admin.username, email: request.admin.email, displayName: request.admin.display_name } : null }));
+app.get('/api/auth/session', async (request) => ({ user: request.admin ? { id: request.admin.id, username: request.admin.username, email: request.admin.email, displayName: request.admin.display_name, platformRole: request.admin.platform_role } : null }));
 app.post('/api/auth/logout', async (request, reply) => {
   const token = request.cookies[SESSION_COOKIE]; if (token) db.prepare('DELETE FROM sessions WHERE token_hash=?').run(sha256(token));
   reply.clearCookie(SESSION_COOKIE, { path: '/' }); addActivity('security', 'Administrator signed out'); return { ok: true };
@@ -193,6 +232,326 @@ app.delete('/api/auth/sessions/:id', async (request, reply) => {
   if (id === request.sessionId) throw badRequest('Use the sign-out action to end your current session.');
   db.prepare('DELETE FROM sessions WHERE id=? AND user_id=?').run(id, request.admin!.id); return reply.code(204).send();
 });
+
+// V4 account lifecycle. Verification and recovery tokens are random, single-use and stored only as hashes.
+const registerSchema = z.object({
+  username: z.string().trim().min(3).max(40).regex(/^[a-zA-Z0-9_.-]+$/),
+  email: z.string().trim().email().max(254),
+  displayName: z.string().trim().min(2).max(80),
+  password: z.string().min(12).max(128),
+  passwordConfirmation: z.string().min(12).max(128),
+}).refine((value) => value.password === value.passwordConfirmation, { path: ['passwordConfirmation'], message: 'Passwords do not match.' });
+
+app.post('/api/auth/register', { config: { rateLimit: { max: 3, timeWindow: '1 hour' } } }, async (request, reply) => {
+  const body = parseBody(registerSchema, request.body);
+  if (!isEmailDeliveryConfigured()) throw Object.assign(new EmailDeliveryUnavailableError(), { statusCode: 503, code: 'EMAIL_UNAVAILABLE' });
+  const normalizedEmail = body.email.toLowerCase();
+  if (db.prepare('SELECT 1 FROM admin WHERE username=? OR email=?').get(body.username, normalizedEmail)) throw conflict('That username or email is already in use.');
+  const id = randomUUID();
+  const token = randomToken(32);
+  const now = nowIso();
+  const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+  const passwordHash = await hashPassword(body.password);
+  try {
+    db.transaction(() => {
+      db.prepare(`INSERT INTO admin(id,username,email,display_name,password_hash,created_at,platform_role,account_status,email_verified_at)
+        VALUES(?,?,?,?,?,?,'member','active',NULL)`).run(id, body.username, normalizedEmail, body.displayName, passwordHash, now);
+      createPersonalOrganization(id, body.displayName, now);
+      db.prepare(`INSERT INTO email_verification_tokens(id,user_id,token_hash,expires_at,created_at) VALUES(?,?,?,?,?)`)
+        .run(randomUUID(), id, sha256(token), expiresAt, now);
+    })();
+    const verifyUrl = `${config.frontendOrigin}/verify-email?token=${encodeURIComponent(token)}`;
+    await sendTransactionalEmail({
+      to: normalizedEmail,
+      subject: 'Verify your NODEBASE account',
+      text: `Welcome to NODEBASE. Verify your email within 24 hours: ${verifyUrl}`,
+      html: `<p>Welcome to NODEBASE.</p><p><a href="${safeEmailHtml(verifyUrl)}">Verify your email address</a>. This link expires in 24 hours.</p>`,
+    });
+  } catch (error) {
+    // A failed mail send must not leave an account that cannot complete verification.
+    db.transaction(() => {
+      db.prepare('DELETE FROM email_verification_tokens WHERE user_id=?').run(id);
+      db.prepare('DELETE FROM organization_memberships WHERE user_id=?').run(id);
+      db.prepare('DELETE FROM organizations WHERE owner_user_id=?').run(id);
+      db.prepare('DELETE FROM admin WHERE id=? AND email_verified_at IS NULL').run(id);
+    })();
+    if ((error as any)?.code === 'SQLITE_CONSTRAINT_UNIQUE') throw conflict('That username or email is already in use.');
+    if (error instanceof EmailDeliveryUnavailableError) throw Object.assign(error, { statusCode: 503, code: 'EMAIL_UNAVAILABLE' });
+    request.log.error({ err: error, requestId: request.id }, 'Account verification email could not be delivered');
+    throw Object.assign(new Error('The verification email could not be delivered. Check SMTP configuration and try again.'), { statusCode: 503, code: 'EMAIL_DELIVERY_FAILED' });
+  }
+  auditPlatform(id, 'account.registered', 'user', id);
+  return reply.code(202).send({ ok: true, verificationRequired: true, message: 'Check your email to verify your account. Your personal workspace has been prepared.' });
+});
+
+function consumeEmailVerificationToken(token: string) {
+  // Read, validate, and consume inside one SQLite transaction. This makes the
+  // single-use guarantee hold even when two confirmation POSTs race.
+  const userId = db.transaction(() => {
+    const now = nowIso();
+    const record = db.prepare(`SELECT t.id,t.user_id,t.expires_at,t.used_at,a.email_verified_at
+      FROM email_verification_tokens t JOIN admin a ON a.id=t.user_id WHERE t.token_hash=?`).get(sha256(token)) as any;
+    if (!record || record.used_at || record.expires_at <= now || record.email_verified_at) {
+      throw Object.assign(new Error('This verification link is invalid, expired or already used.'), { statusCode: 400 });
+    }
+    const consumed = db.prepare('UPDATE email_verification_tokens SET used_at=? WHERE id=? AND used_at IS NULL').run(now, record.id);
+    if (consumed.changes !== 1) throw Object.assign(new Error('This verification link is invalid, expired or already used.'), { statusCode: 400 });
+    const verified = db.prepare('UPDATE admin SET email_verified_at=? WHERE id=? AND email_verified_at IS NULL').run(now, record.user_id);
+    if (verified.changes !== 1) throw Object.assign(new Error('This verification link is invalid, expired or already used.'), { statusCode: 400 });
+    db.prepare('DELETE FROM email_verification_tokens WHERE user_id=? AND id<>?').run(record.user_id, record.id);
+    return record.user_id as string;
+  })();
+  auditPlatform(userId, 'account.email_verified', 'user', userId);
+}
+app.get('/api/auth/verify-email', async (request, reply) => {
+  const token = (request.query as { token?: string }).token ?? '';
+  if (token.length < 30 || token.length > 200) throw badRequest('Verification token is invalid.');
+  // GET only renders the confirmation route. Mail scanners/prefetchers must not consume tokens.
+  return reply.redirect(`${config.frontendOrigin || '/'}${config.frontendOrigin ? `/verify-email?token=${encodeURIComponent(token)}` : ''}`);
+});
+app.post('/api/auth/verify-email', async (request) => {
+  const body = parseBody(z.object({ token: z.string().min(30).max(200) }), request.body);
+  consumeEmailVerificationToken(body.token);
+  return { ok: true, message: 'Email verified. You can now sign in.' };
+});
+app.post('/api/auth/resend-verification', { config: { rateLimit: { max: 3, timeWindow: '1 hour' } } }, async (request) => {
+  const body = parseBody(z.object({ email: z.string().email().max(254) }), request.body);
+  if (!isEmailDeliveryConfigured()) throw Object.assign(new EmailDeliveryUnavailableError(), { statusCode: 503, code: 'EMAIL_UNAVAILABLE' });
+  const user = db.prepare(`SELECT id,email,display_name FROM admin WHERE email=? AND account_status='active' AND email_verified_at IS NULL`).get(body.email.trim().toLowerCase()) as any;
+  if (!user) return { ok: true, message: 'If the account needs verification, a new email has been sent.' };
+  const token = randomToken(32);
+  const now = nowIso();
+  const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+  db.transaction(() => {
+    db.prepare('DELETE FROM email_verification_tokens WHERE user_id=?').run(user.id);
+    db.prepare('INSERT INTO email_verification_tokens(id,user_id,token_hash,expires_at,created_at) VALUES(?,?,?,?,?)').run(randomUUID(), user.id, sha256(token), expiresAt, now);
+  })();
+  const verifyUrl = `${config.frontendOrigin}/verify-email?token=${encodeURIComponent(token)}`;
+  try {
+    await sendTransactionalEmail({ to:user.email, subject:'Verify your NODEBASE account', text:`Verify your NODEBASE email within 24 hours: ${verifyUrl}`, html:`<p><a href="${safeEmailHtml(verifyUrl)}">Verify your NODEBASE email address</a>. This link expires in 24 hours.</p>` });
+  } catch (error) {
+    db.prepare('DELETE FROM email_verification_tokens WHERE user_id=?').run(user.id);
+    request.log.error({ err:error, requestId:request.id }, 'Verification email could not be resent');
+    throw Object.assign(new Error('Verification email could not be sent. Check SMTP configuration.'), { statusCode:503, code:'EMAIL_DELIVERY_FAILED' });
+  }
+  return { ok:true, message:'If the account needs verification, a new email has been sent.' };
+});
+
+app.post('/api/auth/forgot-password', { config: { rateLimit: { max: 3, timeWindow: '1 hour' } } }, async (request) => {
+  const body = parseBody(z.object({ email: z.string().email().max(254) }), request.body);
+  if (!isEmailDeliveryConfigured()) throw Object.assign(new EmailDeliveryUnavailableError(), { statusCode: 503, code: 'EMAIL_UNAVAILABLE' });
+  const user = db.prepare(`SELECT id,email,display_name FROM admin WHERE email=? AND account_status='active' AND email_verified_at IS NOT NULL`).get(body.email.trim().toLowerCase()) as any;
+  if (!user) return { ok: true, message: 'If the account exists, a password reset email has been sent.' };
+  const token = randomToken(32);
+  const now = nowIso();
+  const expiresAt = new Date(Date.now() + 30 * 60 * 1000).toISOString();
+  db.transaction(() => {
+    db.prepare('DELETE FROM password_reset_tokens WHERE user_id=?').run(user.id);
+    db.prepare('INSERT INTO password_reset_tokens(id,user_id,token_hash,expires_at,created_at) VALUES(?,?,?,?,?)')
+      .run(randomUUID(), user.id, sha256(token), expiresAt, now);
+  })();
+  const resetUrl = `${config.frontendOrigin}/reset-password?token=${encodeURIComponent(token)}`;
+  try {
+    await sendTransactionalEmail({
+      to: user.email,
+      subject: 'Reset your NODEBASE password',
+      text: `A password reset was requested for your NODEBASE account. This link expires in 30 minutes: ${resetUrl}`,
+      html: `<p>A password reset was requested for your NODEBASE account.</p><p><a href="${safeEmailHtml(resetUrl)}">Reset password</a>. This link expires in 30 minutes.</p><p>If you did not request this, you can ignore this email.</p>`,
+    });
+  } catch (error) {
+    db.prepare('DELETE FROM password_reset_tokens WHERE user_id=?').run(user.id);
+    request.log.error({ err: error, requestId: request.id }, 'Password recovery email could not be delivered');
+    throw Object.assign(new Error('Password recovery email could not be delivered. Check SMTP configuration.'), { statusCode: 503, code: 'EMAIL_DELIVERY_FAILED' });
+  }
+  return { ok: true, message: 'If the account exists, a password reset email has been sent.' };
+});
+
+app.post('/api/auth/reset-password', { config: { rateLimit: { max: 5, timeWindow: '15 minutes' } } }, async (request) => {
+  const body = parseBody(z.object({ token: z.string().min(30).max(200), password: z.string().min(12).max(128), passwordConfirmation: z.string().min(12).max(128) })
+    .refine((value) => value.password === value.passwordConfirmation, { path: ['passwordConfirmation'], message: 'Passwords do not match.' }), request.body);
+  const tokenHash = sha256(body.token);
+  const record = db.prepare(`SELECT id,user_id,expires_at,used_at FROM password_reset_tokens WHERE token_hash=?`).get(tokenHash) as any;
+  if (!record || record.used_at || record.expires_at <= nowIso()) throw badRequest('This password reset link is invalid, expired or already used.');
+  const passwordHash = await hashPassword(body.password);
+  const now = nowIso();
+  db.transaction(() => {
+    const changed = db.prepare('UPDATE password_reset_tokens SET used_at=? WHERE id=? AND used_at IS NULL').run(now, record.id).changes;
+    if (!changed) throw conflict('This password reset link has already been used.');
+    db.prepare('UPDATE admin SET password_hash=? WHERE id=?').run(passwordHash, record.user_id);
+    db.prepare('DELETE FROM sessions WHERE user_id=?').run(record.user_id);
+    db.prepare('DELETE FROM password_reset_tokens WHERE user_id=? AND id<>?').run(record.user_id, record.id);
+  })();
+  auditPlatform(record.user_id, 'account.password_reset', 'user', record.user_id);
+  return { ok: true, message: 'Password updated. Sign in again on your devices.' };
+});
+
+// Personal account/profile API.
+app.get('/api/account', async (request) => {
+  const user = db.prepare('SELECT id,username,email,display_name,platform_role,email_verified_at,created_at FROM admin WHERE id=?').get(request.admin!.id) as any;
+  const organizations = db.prepare(`SELECT o.id,o.name,o.slug,o.type,m.role FROM organization_memberships m
+    JOIN organizations o ON o.id=m.organization_id WHERE m.user_id=? AND m.status='active' ORDER BY o.type DESC,o.created_at`).all(request.admin!.id);
+  return { account: user, organizations };
+});
+app.patch('/api/account/profile', async (request) => {
+  const body = parseBody(z.object({ displayName: z.string().trim().min(2).max(80) }), request.body);
+  db.prepare('UPDATE admin SET display_name=? WHERE id=?').run(body.displayName, request.admin!.id);
+  return { ok: true, displayName: body.displayName };
+});
+app.put('/api/account/password', async (request) => {
+  const body = parseBody(z.object({ currentPassword: z.string().min(1).max(128), newPassword: z.string().min(12).max(128) }), request.body);
+  const user = db.prepare('SELECT password_hash FROM admin WHERE id=?').get(request.admin!.id) as any;
+  if (!await verifyPassword(body.currentPassword, user.password_hash)) throw Object.assign(new Error('Current password is incorrect.'), { statusCode: 401 });
+  const passwordHash = await hashPassword(body.newPassword);
+  db.transaction(() => {
+    db.prepare('UPDATE admin SET password_hash=? WHERE id=?').run(passwordHash, request.admin!.id);
+    db.prepare('DELETE FROM sessions WHERE user_id=? AND id<>?').run(request.admin!.id, request.sessionId);
+    db.prepare('DELETE FROM password_reset_tokens WHERE user_id=?').run(request.admin!.id);
+  })();
+  auditPlatform(request.admin!.id, 'account.password_changed', 'user', request.admin!.id);
+  return { ok: true };
+});
+
+// Organization and membership API. Every route checks membership from the session identity.
+app.get('/api/organizations', async (request) => ({ organizations: db.prepare(`SELECT o.id,o.name,o.slug,o.description,o.type,o.owner_user_id,o.created_at,o.updated_at,m.role,m.joined_at
+  FROM organization_memberships m JOIN organizations o ON o.id=m.organization_id WHERE m.user_id=? AND m.status='active' ORDER BY o.created_at`).all(request.admin!.id) }));
+app.post('/api/organizations', { config: { rateLimit: { max: 5, timeWindow: '1 hour' } } }, async (request, reply) => {
+  const body = parseBody(z.object({ name: z.string().trim().min(2).max(80), description: z.string().trim().max(500).default('') }), request.body);
+  const id = randomUUID();
+  const now = nowIso();
+  const base = body.name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 35) || 'workspace';
+  const slug = `${base}-${id.slice(0, 8)}`;
+  db.transaction(() => {
+    db.prepare(`INSERT INTO organizations(id,name,slug,description,type,owner_user_id,created_at,updated_at) VALUES(?,?,?,?,'team',?,?,?)`)
+      .run(id, body.name, slug, body.description, request.admin!.id, now, now);
+    db.prepare(`INSERT INTO organization_memberships(organization_id,user_id,role,status,joined_at,created_at,updated_at) VALUES(?,?,'owner','active',?,?,?)`)
+      .run(id, request.admin!.id, now, now, now);
+  })();
+  auditPlatform(request.admin!.id, 'organization.created', 'organization', id);
+  return reply.code(201).send({ organization: { id, name: body.name, slug, description: body.description, type: 'team', role: 'owner' } });
+});
+app.get('/api/organizations/:organizationId', async (request) => {
+  const { organizationId } = request.params as { organizationId: string };
+  const membership = requireOrganizationMembership(organizationId, request.admin!.id);
+  const counts = db.prepare(`SELECT COUNT(*) AS members FROM organization_memberships WHERE organization_id=? AND status='active'`).get(organizationId) as any;
+  return { organization: { id: membership.organization_id, name: membership.name, slug: membership.slug, description: membership.description, type: membership.type, ownerUserId: membership.owner_user_id, createdAt: membership.created_at, updatedAt: membership.updated_at, role: membership.role, memberCount: counts.members } };
+});
+app.patch('/api/organizations/:organizationId', async (request) => {
+  const { organizationId } = request.params as { organizationId: string };
+  requireOrganizationRole(organizationId, request.admin!.id, ['owner','admin']);
+  const body = parseBody(z.object({ name: z.string().trim().min(2).max(80).optional(), description: z.string().trim().max(500).optional() }).refine(v => v.name !== undefined || v.description !== undefined), request.body);
+  const current = db.prepare('SELECT name,description FROM organizations WHERE id=?').get(organizationId) as any;
+  const name = body.name ?? current.name;
+  const description = body.description ?? current.description;
+  db.prepare('UPDATE organizations SET name=?,description=?,updated_at=? WHERE id=?').run(name, description, nowIso(), organizationId);
+  return { ok: true, organization: { id: organizationId, name, description } };
+});
+app.get('/api/organizations/:organizationId/members', async (request) => {
+  const { organizationId } = request.params as { organizationId: string };
+  requireOrganizationMembership(organizationId, request.admin!.id);
+  const members = db.prepare(`SELECT a.id,a.username,a.email,a.display_name,m.role,m.joined_at,m.status
+    FROM organization_memberships m JOIN admin a ON a.id=m.user_id WHERE m.organization_id=? ORDER BY CASE m.role WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 WHEN 'developer' THEN 2 ELSE 3 END,m.joined_at`).all(organizationId);
+  return { members };
+});
+app.post('/api/organizations/:organizationId/invitations', { config: { rateLimit: { max: 20, timeWindow: '1 hour' } } }, async (request, reply) => {
+  const { organizationId } = request.params as { organizationId: string };
+  const inviter = requireOrganizationRole(organizationId, request.admin!.id, ['owner','admin']);
+  const body = parseBody(z.object({ email: z.string().trim().email().max(254), role: z.enum(['admin','developer','viewer']) }), request.body);
+  if (inviter.role !== 'owner' && body.role === 'admin') throw forbidden('Only the organization owner can invite an administrator.');
+  if (!isEmailDeliveryConfigured()) throw Object.assign(new EmailDeliveryUnavailableError(), { statusCode: 503, code: 'EMAIL_UNAVAILABLE' });
+  const email = body.email.toLowerCase();
+  const target = db.prepare('SELECT id FROM admin WHERE email=? AND account_status=\'active\'').get(email) as any;
+  if (target) {
+    const existing = db.prepare('SELECT status FROM organization_memberships WHERE organization_id=? AND user_id=?').get(organizationId, target.id) as any;
+    if (existing?.status === 'active') throw conflict('This user is already an active member.');
+  }
+  const id = randomUUID();
+  const token = randomToken(32);
+  const now = nowIso();
+  const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+  db.prepare(`INSERT INTO organization_invitations(id,organization_id,email,role,token_hash,created_by,expires_at,created_at) VALUES(?,?,?,?,?,?,?,?)`)
+    .run(id, organizationId, email, body.role, sha256(token), request.admin!.id, expiresAt, now);
+  const organization = db.prepare('SELECT name FROM organizations WHERE id=?').get(organizationId) as any;
+  const inviteUrl = `${config.frontendOrigin}/invite/accept?token=${encodeURIComponent(token)}`;
+  try {
+    await sendTransactionalEmail({
+      to: email,
+      subject: `Invitation to ${organization.name.replace(/[\r\n]+/g, ' ').slice(0, 120)} on NODEBASE`,
+      text: `You have been invited to ${organization.name} as ${body.role}. Sign in or create an account with this email, then accept the invitation: ${inviteUrl}`,
+      html: `<p>You have been invited to <b>${safeEmailHtml(organization.name)}</b> as ${body.role}.</p><p><a href="${safeEmailHtml(inviteUrl)}">Accept invitation</a>. This link expires in seven days.</p>`,
+    });
+  } catch (error) {
+    db.prepare('DELETE FROM organization_invitations WHERE id=?').run(id);
+    request.log.error({ err: error, requestId: request.id }, 'Organization invitation email could not be delivered');
+    throw Object.assign(new Error('Invitation email could not be delivered. Check SMTP configuration.'), { statusCode: 503, code: 'EMAIL_DELIVERY_FAILED' });
+  }
+  auditPlatform(request.admin!.id, 'organization.invitation_sent', 'organization_invitation', id, { email, role: body.role });
+  return reply.code(201).send({ invitation: { id, email, role: body.role, expiresAt } });
+});
+app.get('/api/organizations/:organizationId/invitations', async (request) => {
+  const { organizationId } = request.params as { organizationId: string };
+  requireOrganizationRole(organizationId, request.admin!.id, ['owner','admin']);
+  return { invitations: db.prepare(`SELECT id,email,role,expires_at,used_at,revoked_at,created_at FROM organization_invitations WHERE organization_id=? ORDER BY created_at DESC`).all(organizationId) };
+});
+app.delete('/api/organizations/:organizationId/invitations/:invitationId', async (request, reply) => {
+  const { organizationId, invitationId } = request.params as { organizationId: string; invitationId: string };
+  requireOrganizationRole(organizationId, request.admin!.id, ['owner','admin']);
+  const result = db.prepare(`UPDATE organization_invitations SET revoked_at=? WHERE id=? AND organization_id=? AND used_at IS NULL AND revoked_at IS NULL`).run(nowIso(), invitationId, organizationId);
+  if (!result.changes) throw notFound('Invitation not found or already used.');
+  return reply.code(204).send();
+});
+app.post('/api/organizations/invitations/accept', async (request) => {
+  const body = parseBody(z.object({ token: z.string().min(30).max(200) }), request.body);
+  const invite = db.prepare(`SELECT i.*,o.name FROM organization_invitations i JOIN organizations o ON o.id=i.organization_id WHERE i.token_hash=?`).get(sha256(body.token)) as any;
+  if (!invite || invite.used_at || invite.revoked_at || invite.expires_at <= nowIso()) throw badRequest('This invitation is invalid, expired or already used.');
+  if (invite.email.toLowerCase() !== request.admin!.email.toLowerCase()) throw forbidden('Sign in with the email address that received this invitation.');
+  const now = nowIso();
+  db.transaction(() => {
+    const changed = db.prepare(`UPDATE organization_invitations SET used_at=? WHERE id=? AND used_at IS NULL AND revoked_at IS NULL`).run(now, invite.id).changes;
+    if (!changed) throw conflict('This invitation has already been accepted.');
+    db.prepare(`INSERT INTO organization_memberships(organization_id,user_id,role,status,joined_at,created_at,updated_at)
+      VALUES(?,?,?,'active',?,?,?) ON CONFLICT(organization_id,user_id) DO UPDATE SET role=excluded.role,status='active',joined_at=excluded.joined_at,updated_at=excluded.updated_at`)
+      .run(invite.organization_id, request.admin!.id, invite.role, now, now, now);
+  })();
+  auditPlatform(request.admin!.id, 'organization.invitation_accepted', 'organization', invite.organization_id);
+  return { ok: true, organization: { id: invite.organization_id, name: invite.name, role: invite.role } };
+});
+app.patch('/api/organizations/:organizationId/members/:userId', async (request) => {
+  const { organizationId, userId } = request.params as { organizationId: string; userId: string };
+  const actor = requireOrganizationRole(organizationId, request.admin!.id, ['owner','admin']);
+  const body = parseBody(z.object({ role: z.enum(['admin','developer','viewer']) }), request.body);
+  const target = requireOrganizationMembership(organizationId, userId);
+  if (target.role === 'owner') throw forbidden('Transfer ownership before changing the owner role.');
+  if (actor.role !== 'owner' && (target.role === 'admin' || body.role === 'admin')) throw forbidden('Only the owner can change administrator roles.');
+  db.prepare('UPDATE organization_memberships SET role=?,updated_at=? WHERE organization_id=? AND user_id=?').run(body.role, nowIso(), organizationId, userId);
+  auditPlatform(request.admin!.id, 'organization.member_role_changed', 'organization_member', userId, { organizationId, role: body.role });
+  return { ok: true };
+});
+app.delete('/api/organizations/:organizationId/members/:userId', async (request, reply) => {
+  const { organizationId, userId } = request.params as { organizationId: string; userId: string };
+  const actor = requireOrganizationRole(organizationId, request.admin!.id, ['owner','admin']);
+  if (userId === request.admin!.id) throw badRequest('Use ownership transfer before leaving an organization you own.');
+  const target = requireOrganizationMembership(organizationId, userId);
+  if (target.role === 'owner') throw forbidden('The organization owner cannot be removed. Transfer ownership first.');
+  if (actor.role !== 'owner' && target.role === 'admin') throw forbidden('Only the owner can remove an organization administrator.');
+  db.prepare(`UPDATE organization_memberships SET status='suspended',updated_at=? WHERE organization_id=? AND user_id=?`).run(nowIso(), organizationId, userId);
+  return reply.code(204).send();
+});
+app.post('/api/organizations/:organizationId/transfer-ownership', async (request) => {
+  const { organizationId } = request.params as { organizationId: string };
+  requireOrganizationRole(organizationId, request.admin!.id, ['owner']);
+  const body = parseBody(z.object({ newOwnerUserId: z.string().min(1).max(100) }), request.body);
+  const newOwner = requireOrganizationMembership(organizationId, body.newOwnerUserId);
+  if (newOwner.user_id === request.admin!.id) throw badRequest('This user is already the owner.');
+  const now = nowIso();
+  db.transaction(() => {
+    db.prepare(`UPDATE organization_memberships SET role='admin',updated_at=? WHERE organization_id=? AND user_id=?`).run(now, organizationId, request.admin!.id);
+    db.prepare(`UPDATE organization_memberships SET role='owner',updated_at=? WHERE organization_id=? AND user_id=?`).run(now, organizationId, body.newOwnerUserId);
+    db.prepare('UPDATE organizations SET owner_user_id=?,updated_at=? WHERE id=?').run(body.newOwnerUserId, now, organizationId);
+  })();
+  auditPlatform(request.admin!.id, 'organization.ownership_transferred', 'organization', organizationId, { newOwnerUserId: body.newOwnerUserId });
+  return { ok: true, ownerUserId: body.newOwnerUserId };
+});
+
 
 app.get('/api/dashboard', async () => {
   let bots = db.prepare('SELECT id,name,runtime,status,container_id,created_at,updated_at,last_deployed_at,last_error FROM bots ORDER BY updated_at DESC').all() as any[];

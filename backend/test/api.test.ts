@@ -80,7 +80,86 @@ test('uploaded files stay private and can be downloaded through an authorized ro
 
 test('database schema is tracked through a versioned migration', () => {
   const applied = db.prepare('SELECT version FROM schema_migrations ORDER BY version').all().map((row: any) => row.version);
-  assert.deepEqual(applied, ['001_initial.sql', '002_nodes.sql', '003_watch.sql']);
+  assert.deepEqual(applied, ['001_initial.sql', '002_nodes.sql', '003_watch.sql', '004_v4_accounts_organizations.sql']);
+});
+
+
+test('email verification GET is non-consuming and explicit POST verifies the single-use token', async () => {
+  const { randomUUID } = await import('node:crypto');
+  const { randomToken, sha256 } = await import('../src/security.js');
+  const userId = randomUUID();
+  const rawToken = randomToken(32);
+  const now = new Date().toISOString();
+  db.prepare(`INSERT INTO admin(id,username,email,display_name,password_hash,created_at,platform_role,account_status,email_verified_at)
+    VALUES(?,?,?,?,?,?,'member','active',NULL)`).run(userId, `verify-${userId.slice(0,8)}`, `verify-${userId.slice(0,8)}@example.test`, 'Verify Test', 'scrypt$unused$unused', now);
+  const tokenId = randomUUID();
+  db.prepare('INSERT INTO email_verification_tokens(id,user_id,token_hash,expires_at,created_at) VALUES(?,?,?,?,?)')
+    .run(tokenId, userId, sha256(rawToken), new Date(Date.now()+3600000).toISOString(), now);
+
+  const landing = await app.inject({ method: 'GET', url: `/api/auth/verify-email?token=${encodeURIComponent(rawToken)}` });
+  assert.equal(landing.statusCode, 302, landing.body);
+  assert.equal(db.prepare('SELECT email_verified_at FROM admin WHERE id=?').get(userId).email_verified_at, null);
+  assert.equal(db.prepare('SELECT used_at FROM email_verification_tokens WHERE id=?').get(tokenId).used_at, null);
+
+  const confirmed = await app.inject({ method: 'POST', url: '/api/auth/verify-email', headers: { cookie: `nb_csrf=${csrf}`, 'x-csrf-token': csrf, 'content-type': 'application/json' }, payload: { token: rawToken } });
+  assert.equal(confirmed.statusCode, 200, confirmed.body);
+  assert.ok(db.prepare('SELECT email_verified_at FROM admin WHERE id=?').get(userId).email_verified_at);
+  assert.ok(db.prepare('SELECT used_at FROM email_verification_tokens WHERE id=?').get(tokenId).used_at);
+
+  const replay = await app.inject({ method: 'POST', url: '/api/auth/verify-email', headers: { cookie: `nb_csrf=${csrf}`, 'x-csrf-token': csrf, 'content-type': 'application/json' }, payload: { token: rawToken } });
+  assert.equal(replay.statusCode, 400, 'a verification token cannot be consumed twice');
+});
+
+test('V4 organization boundaries hide unrelated organizations and block unscoped V3 resources for members', async () => {
+  const { randomUUID } = await import('node:crypto');
+  const { randomToken, sha256 } = await import('../src/security.js');
+  const userId = randomUUID();
+  const organizationId = randomUUID();
+  const now = new Date().toISOString();
+  db.prepare(`INSERT INTO admin(id,username,email,display_name,password_hash,created_at,platform_role,account_status,email_verified_at)
+    VALUES(?,?,?,?,? ,?,'member','active',?)`).run(userId, 'membertest', 'member@example.test', 'Member Test', 'scrypt$unused$unused', now, now);
+  db.prepare(`INSERT INTO organizations(id,name,slug,description,type,owner_user_id,created_at,updated_at) VALUES(?,?,?,'','team',?,?,?)`)
+    .run(organizationId, 'Member Team', `team-${userId.slice(0,8)}`, userId, now, now);
+  db.prepare(`INSERT INTO organization_memberships(organization_id,user_id,role,status,joined_at,created_at,updated_at) VALUES(?,?,'owner','active',?,?,?)`)
+    .run(organizationId, userId, now, now, now);
+  const sessionToken = randomToken();
+  db.prepare(`INSERT INTO sessions(id,token_hash,csrf_token,user_id,expires_at,created_at,user_agent,ip) VALUES(?,?,?,?,?,?,?,?)`)
+    .run(randomUUID(), sha256(sessionToken), csrf, userId, new Date(Date.now()+3600000).toISOString(), now, 'test', '127.0.0.1');
+  const memberCookie = `nb_session=${sessionToken}; nb_csrf=${csrf}`;
+
+  // Regular members can revoke their other device sessions; this nested route must not be blocked by the legacy API guard.
+  const otherSessionId = randomUUID();
+  db.prepare(`INSERT INTO sessions(id,token_hash,csrf_token,user_id,expires_at,created_at,user_agent,ip) VALUES(?,?,?,?,?,?,?,?)`)
+    .run(otherSessionId, sha256(randomToken()), csrf, userId, new Date(Date.now()+3600000).toISOString(), now, 'second device', '127.0.0.1');
+  const revoked = await app.inject({ method: 'DELETE', url: `/api/auth/sessions/${otherSessionId}`, headers: { cookie: memberCookie, 'x-csrf-token': csrf } });
+  assert.equal(revoked.statusCode, 204, revoked.body);
+
+  const listed = await app.inject({ method: 'GET', url: '/api/organizations', headers: { cookie: memberCookie } });
+  assert.equal(listed.statusCode, 200, listed.body);
+  assert.equal(listed.json().organizations.length, 1);
+  assert.equal(listed.json().organizations[0].id, organizationId);
+
+  const foreign = await app.inject({ method: 'GET', url: `/api/organizations/${db.prepare('SELECT id FROM organizations WHERE owner_user_id<>? LIMIT 1').get(userId)?.id ?? randomUUID()}`, headers: { cookie: memberCookie } });
+  assert.equal(foreign.statusCode, 404, foreign.body);
+
+  const legacy = await app.inject({ method: 'GET', url: '/api/files', headers: { cookie: memberCookie } });
+  assert.equal(legacy.statusCode, 403, legacy.body);
+  assert.equal(legacy.json().error.code, 'V4_MODULE_NOT_READY');
+
+  const created = await app.inject({ method: 'POST', url: '/api/organizations', headers: { cookie: memberCookie, 'x-csrf-token': csrf, 'content-type': 'application/json' }, payload: { name: 'Second Team', description: 'Created through the V4 API' } });
+  assert.equal(created.statusCode, 201, created.body);
+  assert.equal(created.json().organization.role, 'owner');
+
+  const viewerId = randomUUID();
+  db.prepare(`INSERT INTO admin(id,username,email,display_name,password_hash,created_at,platform_role,account_status,email_verified_at)
+    VALUES(?,?,?,?,? ,?,'member','active',?)`).run(viewerId, `viewer-${userId.slice(0,6)}`, `viewer-${userId.slice(0,6)}@example.test`, 'Viewer Test', 'scrypt$unused$unused', now, now);
+  db.prepare(`INSERT INTO organization_memberships(organization_id,user_id,role,status,joined_at,created_at,updated_at) VALUES(?,?,'viewer','active',?,?,?)`)
+    .run(organizationId, viewerId, now, now, now);
+  const viewerToken = randomToken();
+  db.prepare(`INSERT INTO sessions(id,token_hash,csrf_token,user_id,expires_at,created_at,user_agent,ip) VALUES(?,?,?,?,?,?,?,?)`)
+    .run(randomUUID(), sha256(viewerToken), csrf, viewerId, new Date(Date.now()+3600000).toISOString(), now, 'viewer test', '127.0.0.1');
+  const viewerInvite = await app.inject({ method: 'POST', url: `/api/organizations/${organizationId}/invitations`, headers: { cookie: `nb_session=${viewerToken}; nb_csrf=${csrf}`, 'x-csrf-token': csrf, 'content-type': 'application/json' }, payload: { email: 'someone@example.test', role: 'viewer' } });
+  assert.equal(viewerInvite.statusCode, 403, viewerInvite.body);
 });
 
 

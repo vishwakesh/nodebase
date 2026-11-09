@@ -13,7 +13,7 @@ import {
 import { WatchPage, WatchInviteAccess, WatchGuestRoom } from './features/watch/WatchPage.js';
 import './styles.css';
 
-type UserInfo = { id: string; username: string; email: string; displayName: string };
+type UserInfo = { id: string; username: string; email: string; displayName: string; platformRole?: 'platform_admin'|'member' };
 type BotRow = { id: string; name: string; runtime: 'python'|'node'; entrypoint: string; status: string; created_at: string; updated_at: string; last_deployed_at?: string; last_error?: string|null; installDeps: boolean; restartOnFailure: boolean; runnerConnected: boolean };
 type FolderRow = { id: string; name: string; parent_id: string|null; created_at?: string; updated_at?: string };
 type FileRow = { id: string; name: string; folder_id: string|null; size: number; mime_type: string; created_at: string; updated_at: string };
@@ -87,7 +87,8 @@ function App(){
   if(checking) return <div className="boot-screen"><div className="brand-mark large"><Network size={25}/></div><span className="wordmark">nodebase</span><LoaderCircle className="spin" size={20}/><p>Connecting to your workspace…</p></div>;
   if(watchInviteToken) return <WatchInviteAccess api={API} token={watchInviteToken} onJoined={id=>{setWatchInviteToken(null);setWatchGuestRoomId(id);window.history.replaceState({},'',`/?watchRoom=${encodeURIComponent(id)}`)}}/>;
   if(watchGuestRoomId) return <WatchGuestRoom api={API} roomId={watchGuestRoomId}/>;
-  if(!user) return <AuthScreen setupRequired={Boolean(setupRequired)} setupKeyConfigured={setupKeyConfigured} error={authError} loading={authLoading} onSubmit={async(data,mode)=>{setAuthError('');setAuthLoading(true);try{const url=mode==='setup'?'/api/auth/setup':'/api/auth/login';const res=await API<{user:UserInfo}>(url,{method:'POST',body:JSON.stringify(data)});setUser(res.user);setPage('overview');ping(mode==='setup'?'Workspace created. Welcome to NODEBASE.':'Welcome back.');}catch(e){setAuthError((e as Error).message)}finally{setAuthLoading(false)}}}/>;
+  if(!user) return <AuthScreen setupRequired={Boolean(setupRequired)} setupKeyConfigured={setupKeyConfigured} error={authError} loading={authLoading} onSubmit={async(data,mode)=>{setAuthError('');setAuthLoading(true);try{const routes:Record<string,string>={setup:'/api/auth/setup',login:'/api/auth/login',register:'/api/auth/register',forgot:'/api/auth/forgot-password',resend:'/api/auth/resend-verification',reset:'/api/auth/reset-password',verify:'/api/auth/verify-email'};const res=await API<any>(routes[mode],{method:'POST',body:JSON.stringify(data)});if(mode==='setup'||mode==='login'){setUser(res.user);setPage('overview');ping(mode==='setup'?'Workspace created. Welcome to NODEBASE.':'Welcome back.');}return res;}catch(e){setAuthError((e as Error).message);throw e}finally{setAuthLoading(false)}}}/>;
+  if(user.platformRole==='member') return <MemberWorkspace user={user} onUserUpdate={setUser} onSignout={async()=>{try{await API('/api/auth/logout',{method:'POST'})}catch{}setUser(null);await loadAuth()}}/>;
   return <div className="app-shell">
     <Sidebar page={page} setPage={setPage} open={sidebarOpen} setOpen={setSidebarOpen} collapsed={collapsed} setCollapsed={setCollapsed} setBotId={id=>{setCurrentBotId(id);setPage('console');setBotTab('console')}} />
     <div className={`main-column ${collapsed?'sidebar-collapsed':''}`}>
@@ -106,7 +107,108 @@ function App(){
     {toast&&<div className={`toast toast-${toast.type}`}><span className="toast-icon">{toast.type==='success'?<CheckCircle2 size={17}/>:toast.type==='error'?<CircleAlert size={17}/>:<CircleHelp size={17}/>}</span><span>{toast.message}</span><button aria-label="Dismiss" onClick={()=>setToast(null)}><X size={15}/></button></div>}
   </div>;
 }
-function Brand({compact=false}:{compact?:boolean}) { return <div className="brand"><span className="brand-mark"><Network size={20} strokeWidth={2.5}/></span>{!compact&&<span className="wordmark">nodebase<span className="brand-dot">.</span><span className="brand-version">V3</span></span>}</div>; }
+function MemberWorkspace({user,onUserUpdate,onSignout}:{user:UserInfo;onUserUpdate:(user:UserInfo)=>void;onSignout:()=>Promise<void>}){
+  const [organizations,setOrganizations]=useState<any[]>([]);
+  const [selectedId,setSelectedId]=useState('');
+  const [members,setMembers]=useState<any[]>([]);
+  const [sessions,setSessions]=useState<any[]>([]);
+  const [loading,setLoading]=useState(true);
+  const [busy,setBusy]=useState(false);
+  const [message,setMessage]=useState('');
+  const [error,setError]=useState('');
+  const [orgName,setOrgName]=useState('');
+  const [orgDescription,setOrgDescription]=useState('');
+  const [inviteEmail,setInviteEmail]=useState('');
+  const [inviteRole,setInviteRole]=useState<'admin'|'developer'|'viewer'>('developer');
+  const [displayName,setDisplayName]=useState(user.displayName);
+  const [currentPassword,setCurrentPassword]=useState('');
+  const [newPassword,setNewPassword]=useState('');
+  const load=useCallback(async()=>{
+    setLoading(true);setError('');
+    try{
+      const [orgData,accountData,sessionData]=await Promise.all([
+        API<{organizations:any[]}>('/api/organizations'),
+        API<{account:any}>('/api/account'),
+        API<{sessions:any[]}>('/api/auth/sessions'),
+      ]);
+      setOrganizations(orgData.organizations);
+      setSelectedId(current=>orgData.organizations.some(o=>o.id===current)?current:orgData.organizations[0]?.id??'');
+      setDisplayName(accountData.account.display_name);
+      setSessions(sessionData.sessions);
+    }catch(e){setError((e as Error).message)}finally{setLoading(false)}
+  },[]);
+  useEffect(()=>{void load()},[load]);
+  useEffect(()=>{
+    const token=window.location.pathname.endsWith('/invite/accept')?new URLSearchParams(window.location.search).get('token'):null;
+    if(!token)return;
+    API('/api/organizations/invitations/accept',{method:'POST',body:JSON.stringify({token})})
+      .then((result:any)=>{setMessage(`Joined ${result.organization.name}.`);window.history.replaceState({},'','/');return load()})
+      .catch(e=>setError((e as Error).message));
+  },[load]);
+  const selected=organizations.find(o=>o.id===selectedId);
+  const loadMembers=async()=>{if(!selectedId)return;try{const data=await API<{members:any[]}>(`/api/organizations/${selectedId}/members`);setMembers(data.members)}catch(e){setError((e as Error).message)}};
+  useEffect(()=>{setMembers([]);if(selectedId)void loadMembers()},[selectedId]);
+  const createOrganization=async(e:React.FormEvent)=>{
+    e.preventDefault();setBusy(true);setError('');setMessage('');
+    try{const data=await API<any>('/api/organizations',{method:'POST',body:JSON.stringify({name:orgName,description:orgDescription})});setOrgName('');setOrgDescription('');setMessage(`Created ${data.organization.name}.`);await load();setSelectedId(data.organization.id)}
+    catch(e){setError((e as Error).message)}finally{setBusy(false)}
+  };
+  const invite=async(e:React.FormEvent)=>{
+    e.preventDefault();if(!selectedId)return;setBusy(true);setError('');setMessage('');
+    try{await API(`/api/organizations/${selectedId}/invitations`,{method:'POST',body:JSON.stringify({email:inviteEmail,role:inviteRole})});setInviteEmail('');setMessage('Invitation email sent. The recipient must sign in with that email to accept it.')}
+    catch(e){setError((e as Error).message)}finally{setBusy(false)}
+  };
+  const saveProfile=async(e:React.FormEvent)=>{
+    e.preventDefault();setBusy(true);setError('');setMessage('');
+    try{await API('/api/account/profile',{method:'PATCH',body:JSON.stringify({displayName})});onUserUpdate({...user,displayName});setMessage('Profile updated.')}
+    catch(e){setError((e as Error).message)}finally{setBusy(false)}
+  };
+  const changePassword=async(e:React.FormEvent)=>{
+    e.preventDefault();setBusy(true);setError('');setMessage('');
+    try{await API('/api/account/password',{method:'PUT',body:JSON.stringify({currentPassword,newPassword})});setCurrentPassword('');setNewPassword('');setMessage('Password changed. Other device sessions have been revoked.');const data=await API<{sessions:any[]}>('/api/auth/sessions');setSessions(data.sessions)}
+    catch(e){setError((e as Error).message)}finally{setBusy(false)}
+  };
+  const revokeSession=async(id:string)=>{
+    if(!window.confirm('Sign out this device?'))return;
+    setBusy(true);setError('');
+    try{await API(`/api/auth/sessions/${id}`,{method:'DELETE'});setSessions(value=>value.filter(session=>session.id!==id));setMessage('Device session revoked.')}
+    catch(e){setError((e as Error).message)}finally{setBusy(false)}
+  };
+  return <div className="v4-member-shell">
+    <header className="v4-member-header"><Brand/><div className="v4-member-user"><span className="avatar">{(user.displayName||user.username).slice(0,1).toUpperCase()}</span><div><b>{user.displayName}</b><small>{user.email}</small></div><button className="btn btn-ghost" onClick={onSignout}><LogOut size={15}/> Sign out</button></div></header>
+    <main className="v4-member-main">
+      <div className="v4-member-intro"><span className="eyebrow">NODEBASE V4 FOUNDATION</span><h1>Your workspace starts here.</h1><p>Manage your account, organization, and team access. Bot, cloud, node, and Watch APIs will open for members as each module receives organization-level authorization.</p></div>
+      {error&&<div className="inline-alert danger-alert"><CircleAlert size={17}/><div><b>Could not complete the request</b><span>{error}</span></div></div>}
+      {message&&<div className="inline-alert info-alert"><CheckCircle2 size={17}/><div><b>Done</b><span>{message}</span></div></div>}
+      <div className="v4-member-grid">
+        <section className="panel v4-member-card">
+          <div className="panel-header"><div><h3>Your organizations</h3><p>Personal workspace and team memberships</p></div><button className="icon-btn" onClick={()=>void load()} title="Refresh"><RefreshCw size={16}/></button></div>
+          {loading?<div className="cloud-loading"><LoaderCircle size={19} className="spin"/> Loading organizations…</div>:organizations.length===0?<p className="muted-text">No organizations yet.</p>:<div className="v4-org-list">{organizations.map(org=><button key={org.id} className={`v4-org-row ${org.id===selectedId?'selected':''}`} onClick={()=>setSelectedId(org.id)}><span className="v4-org-icon"><Users size={18}/></span><span><b>{org.name}</b><small>{org.type==='personal'?'Personal workspace':'Team organization'} · {org.role}</small></span><ChevronRight size={16}/></button>)}</div>}
+          <form className="stack-form v4-form-divider" onSubmit={createOrganization}><b>Create a team</b><label>Organization name<input value={orgName} onChange={e=>setOrgName(e.target.value)} minLength={2} maxLength={80} placeholder="e.g. Community Tools" required/></label><label>Description <span className="muted-text">(optional)</span><textarea value={orgDescription} onChange={e=>setOrgDescription(e.target.value)} maxLength={500} rows={2} placeholder="What is this workspace for?"/></label><Button type="submit" kind="primary" disabled={busy||!orgName.trim()} icon={<Plus size={15}/>}>Create organization</Button></form>
+        </section>
+        <section className="panel v4-member-card">
+          <div className="panel-header"><div><h3>{selected?.name??'Organization details'}</h3><p>{selected?`${selected.type==='personal'?'Personal organization':'Team organization'} · Your role: ${selected.role}`:'Select an organization to manage it.'}</p></div></div>
+          {selected&&<>
+            <div className="v4-org-details"><span>Organization ID</span><code>{selected.id}</code><span>Slug</span><code>{selected.slug}</code><span>Description</span><span>{selected.description||'No description added.'}</span></div>
+            <div className="v4-form-divider"><div className="panel-header"><div><h3>Members</h3><p>Membership is checked by the API for every organization request.</p></div><Button onClick={loadMembers} icon={<RefreshCw size={14}/>}>Refresh</Button></div><div className="v4-member-list">{members.map(member=><div className="v4-member-row" key={member.id}><span className="avatar">{(member.display_name||member.username).slice(0,1).toUpperCase()}</span><span><b>{member.display_name}</b><small>{member.email}</small></span><span className="v4-role-pill">{member.role}</span></div>)}{members.length===0&&<p className="muted-text">No members found.</p>}</div></div>
+            {['owner','admin'].includes(selected.role)&&<form className="stack-form v4-form-divider" onSubmit={invite}><b>Invite a teammate</b><label>Email address<input type="email" required value={inviteEmail} onChange={e=>setInviteEmail(e.target.value)} placeholder="teammate@example.com"/></label><label>Organization role<select value={inviteRole} onChange={e=>setInviteRole(e.target.value as any)}><option value="developer">Developer — bots and project work</option><option value="viewer">Viewer — read-only access</option>{selected.role==='owner'&&<option value="admin">Admin — organization management</option>}</select></label><Button type="submit" kind="primary" disabled={busy||!inviteEmail.trim()} icon={<Users size={15}/>}>Send invitation</Button><small className="field-hint">Email delivery requires SMTP settings on the NODEBASE server.</small></form>}
+          </>}
+        </section>
+      </div>
+      <div className="v4-account-grid">
+        <section className="panel v4-member-card"><div className="panel-header"><div><h3>Profile & security</h3><p>Update your account details and password</p></div></div>
+          <form className="stack-form" onSubmit={saveProfile}><label>Display name<input value={displayName} onChange={e=>setDisplayName(e.target.value)} minLength={2} maxLength={80} required/></label><Button type="submit" disabled={busy||!displayName.trim()||displayName===user.displayName} icon={<Save size={15}/>}>Save profile</Button></form>
+          <form className="stack-form v4-form-divider" onSubmit={changePassword}><b>Change password</b><label>Current password<input type="password" value={currentPassword} onChange={e=>setCurrentPassword(e.target.value)} required autoComplete="current-password"/></label><label>New password<input type="password" value={newPassword} onChange={e=>setNewPassword(e.target.value)} minLength={12} required autoComplete="new-password"/><small className="field-hint">Use at least 12 characters. Other devices will be signed out.</small></label><Button type="submit" kind="primary" disabled={busy||!currentPassword||newPassword.length<12}>Update password</Button></form>
+        </section>
+        <section className="panel v4-member-card"><div className="panel-header"><div><h3>Active sessions</h3><p>Review devices currently signed in to your account</p></div><Button onClick={()=>void load()} icon={<RefreshCw size={14}/>}>Refresh</Button></div>
+          <div className="v4-session-list">{sessions.map(session=><div className="v4-session-row" key={session.id}><span className="v4-session-icon"><Laptop size={17}/></span><span><b>{session.user_agent||'Unknown device'}</b><small>{dateText(session.created_at)} · Expires {dateText(session.expires_at)}</small></span>{session.current?<span className="v4-role-pill">This device</span>:<Button kind="soft" disabled={busy} onClick={()=>void revokeSession(session.id)}>Revoke</Button>}</div>)}{sessions.length===0&&<p className="muted-text">No active sessions found.</p>}</div>
+        </section>
+      </div>
+      <div className="v4-module-notice"><ShieldCheck size={17}/><span><b>Tenant isolation is active.</b> Existing V3 bot, file, node, and Watch routes remain limited to the migrated platform administrator until their organization-scoped handlers are complete.</span></div>
+    </main>
+  </div>;
+}
+function Brand({compact=false}:{compact?:boolean}) { return <div className="brand"><span className="brand-mark"><Network size={20} strokeWidth={2.5}/></span>{!compact&&<span className="wordmark">nodebase<span className="brand-dot">.</span><span className="brand-version">V4</span></span>}</div>; }
 function Sidebar({page,setPage,open,setOpen,collapsed,setCollapsed,setBotId}:{page:Page;setPage:(v:Page)=>void;open:boolean;setOpen:(v:boolean)=>void;collapsed:boolean;setCollapsed:(v:boolean)=>void;setBotId:(id:string)=>void}){
   const groups=[
     {label:'WORKSPACE',items:[{id:'overview' as Page,label:'Overview',icon:LayoutDashboard}]},
@@ -120,7 +222,7 @@ function Sidebar({page,setPage,open,setOpen,collapsed,setCollapsed,setBotId}:{pa
     {groups.map(group=><section className="sidebar-group" key={group.label}><div className="sidebar-section-label">{group.label}</div><nav className="side-nav">{group.items.map(item=><button key={item.id} title={collapsed?item.label:undefined} className={`nav-item ${page===item.id||(page==='console'&&item.id==='bots')?'active':''}`} onClick={()=>{setPage(item.id);setOpen(false);if(item.id!=='console')setBotId('')}}><item.icon size={19}/><span>{item.label}</span>{item.id==='bots'&&<span className="nav-chevron"><ChevronRight size={14}/></span>}</button>)}</nav></section>)}
     <div className="sidebar-spacer"/><div className="sidebar-bottom">
       <div className="server-card"><span className="server-dot"/><div className="server-card-copy"><b>Workspace status</b><span>API connection active</span><small><span className="tiny-dot"/> Self-hosted VPS</small></div><ChevronDown size={14}/></div>
-      {!collapsed&&<div className="sidebar-footer"><span>NODEBASE <b>V3 workspace</b></span><span>Made for your own stack</span></div>}
+      {!collapsed&&<div className="sidebar-footer"><span>NODEBASE <b>V4 foundation</b></span><span>Made for your own stack</span></div>}
     </div>
   </aside></>;
 }
@@ -155,18 +257,32 @@ function PanelHeader({title,subtitle,action}:{title:string;subtitle?:string;acti
 function BotAvatar({name,size='normal'}:{name:string;size?:'normal'|'large'}){const colors=['avatar-blue','avatar-violet','avatar-mint','avatar-orange','avatar-pink'];let hash=0;for(let i=0;i<name.length;i++)hash=(hash*31+name.charCodeAt(i))|0;const color=colors[Math.abs(hash)%colors.length];return <span className={`bot-avatar ${color} ${size==='large'?'bot-avatar-large':''}`}><Bot size={size==='large'?23:18}/></span>}
 function EmptyState({icon,title,description,action}:{icon:React.ReactNode;title:string;description:string;action?:React.ReactNode}){return <div className="empty-state"><span className="empty-icon">{icon}</span><b>{title}</b><p>{description}</p>{action}</div>}
 function FileIcon({type,name,large=false}:{type?:string;name?:string;large?:boolean}){const ext=(name??'').split('.').pop()?.toLowerCase();let icon:React.ReactNode=<File size={large?22:18}/>;let color='file-neutral';if(type?.startsWith('image/')||['png','jpg','jpeg','gif','webp','svg','avif'].includes(ext??'')){icon=<FileImage size={large?22:18}/>;color='file-purple'}else if(type?.startsWith('video/')||['mp4','mov','mkv','webm'].includes(ext??'')){icon=<FileVideo size={large?22:18}/>;color='file-orange'}else if(type?.startsWith('audio/')||['mp3','wav','ogg','m4a'].includes(ext??'')){icon=<FileAudio size={large?22:18}/>;color='file-pink'}else if(['zip','rar','7z','tar','gz'].includes(ext??'')){icon=<FileArchive size={large?22:18}/>;color='file-orange'}else if(['json','js','ts','tsx','py','rs','html','css','toml'].includes(ext??'')){icon=<FileCode2 size={large?22:18}/>;color='file-green'}else if(['txt','md','pdf','doc','docx'].includes(ext??'')){icon=<FileText size={large?22:18}/>;color='file-blue'}return <span className={`file-type-icon ${color} ${large?'large-file-icon':''}`}>{icon}</span>}
-function AuthScreen({setupRequired,setupKeyConfigured,error,loading,onSubmit}:{setupRequired:boolean;setupKeyConfigured:boolean;error:string;loading:boolean;onSubmit:(data:any,mode:'login'|'setup')=>void}){
-  const [mode,setMode]=useState<'login'|'setup'>(setupRequired?'setup':'login');const [username,setUsername]=useState('');const [email,setEmail]=useState('');const [displayName,setDisplayName]=useState('');const [password,setPassword]=useState('');const [setupKey,setSetupKey]=useState('');const [showPassword,setShowPassword]=useState(false);
-  useEffect(()=>setMode(setupRequired?'setup':'login'),[setupRequired]);
-  return <div className="auth-screen"><div className="auth-left"><div className="auth-brand"><Brand/></div><div className="auth-hero"><span className="hero-chip"><span className="tiny-dot"/> YOUR OWN INFRASTRUCTURE</span><h1>Everything you run.<br/><em>One calm place.</em></h1><p>Manage Discord bots, monitor your server, and keep your files close — in a private workspace you control.</p><div className="auth-illustration"><div className="glow-orb orb-a"/><div className="glow-orb orb-b"/><div className="illustration-window"><div className="window-head"><span/><span/><span/><small>nodebase / workspace</small></div><div className="window-body"><div className="illus-sidebar"><i/><i/><i/><i/></div><div className="illus-content"><div className="illus-title"/><div className="illus-stats"><i/><i/><i/></div><div className="illus-chart"><svg viewBox="0 0 300 75" preserveAspectRatio="none"><path d="M0 61 C20 53 26 31 48 43 S75 61 92 38 S123 15 146 31 S177 49 198 25 S233 43 254 17 S286 25 300 5" fill="none" stroke="currentColor" strokeWidth="2.5"/><path d="M0 61 C20 53 26 31 48 43 S75 61 92 38 S123 15 146 31 S177 49 198 25 S233 43 254 17 S286 25 300 5 V75 H0Z" fill="currentColor" opacity=".08"/></svg></div><div className="illus-bottom"><i/><i/><i/><i/></div></div></div></div><div className="floating-status"><span className="server-dot"/><div><b>All systems personal.</b><small>Your VPS · Your rules.</small></div><CheckCircle2 size={18}/></div></div><div className="auth-trust"><span><ShieldCheck size={15}/> Self-hosted</span><span><LockKeyhole size={15}/> Private by default</span><span><HardDrive size={15}/> Your storage</span></div></div></div><div className="auth-right"><div className="auth-form-shell"><div className="mobile-auth-brand"><Brand/></div><span className="auth-step">{mode==='setup'?'FIRST-TIME SETUP':'SECURE WORKSPACE'}</span><h2>{mode==='setup'?'Set up your workspace':'Welcome back'}</h2><p className="auth-subtitle">{mode==='setup'?'Create your administrator account to secure this NODEBASE instance.':'Sign in to manage your bots and files.'}</p>
+function AuthScreen({setupRequired,setupKeyConfigured,error,loading,onSubmit}:{setupRequired:boolean;setupKeyConfigured:boolean;error:string;loading:boolean;onSubmit:(data:any,mode:'login'|'setup'|'register'|'forgot'|'resend'|'reset'|'verify')=>Promise<any>|void}){
+  type AuthMode='login'|'setup'|'register'|'forgot'|'resend'|'reset'|'verify';
+  const queryToken=new URLSearchParams(window.location.search).get('token')??'';
+  const resetToken=window.location.pathname.endsWith('/reset-password')?queryToken:'';
+  const verificationToken=window.location.pathname.endsWith('/verify-email')?queryToken:'';
+  const [mode,setMode]=useState<AuthMode>(verificationToken?'verify':resetToken?'reset':setupRequired?'setup':'login');
+  const [username,setUsername]=useState('');const [email,setEmail]=useState('');const [displayName,setDisplayName]=useState('');const [password,setPassword]=useState('');const [passwordConfirmation,setPasswordConfirmation]=useState('');const [setupKey,setSetupKey]=useState('');const [showPassword,setShowPassword]=useState(false);const [message,setMessage]=useState(()=>new URLSearchParams(window.location.search).get('verified')==='1'?'Your email is verified. Sign in to continue.':'');
+  useEffect(()=>{if(setupRequired)setMode('setup')},[setupRequired]);
+  const submit=async(e:React.FormEvent)=>{e.preventDefault();setMessage('');const data=mode==='setup'?{setupKey,username,email,displayName:displayName||username,password,passwordConfirmation}:mode==='login'?{username,password}:mode==='register'?{username,email,displayName,password,passwordConfirmation}:(mode==='forgot'||mode==='resend')?{email}:mode==='verify'?{token:verificationToken}:{token:resetToken,password,passwordConfirmation};try{const result=await onSubmit(data,mode);if(mode==='register'||mode==='forgot'||mode==='resend'||mode==='reset'||mode==='verify')setMessage(result?.message??'Request completed.');if(mode==='reset'||mode==='verify'){setMode('login');window.history.replaceState({},'', '/login')}}catch{}};
+  const heading=mode==='setup'?'Set up your workspace':mode==='register'?'Create your NODEBASE account':mode==='forgot'||mode==='resend'?'Recover your account':mode==='reset'?'Choose a new password':mode==='verify'?'Verify your email':'Welcome back';
+  const subtitle=mode==='setup'?'Create your administrator account to secure this NODEBASE instance.':mode==='register'?'Create an account and a personal workspace. Verify your email to sign in.':mode==='forgot'?'We will email a single-use password reset link.':mode==='resend'?'We will send a new single-use email verification link.':mode==='reset'?'Choose a strong password for your account.':mode==='verify'?'Confirm your email address to activate your NODEBASE account.':'Sign in to manage your workspace.';
+  return <div className="auth-screen"><div className="auth-left"><div className="auth-brand"><Brand/></div><div className="auth-hero"><span className="hero-chip"><span className="tiny-dot"/> YOUR OWN INFRASTRUCTURE</span><h1>Everything you run.<br/><em>One calm place.</em></h1><p>Manage Discord bots, monitor your server, and keep your files close — in a private workspace you control.</p><div className="auth-illustration"><div className="glow-orb orb-a"/><div className="glow-orb orb-b"/><div className="illustration-window"><div className="window-head"><span/><span/><span/><small>nodebase / workspace</small></div><div className="window-body"><div className="illus-sidebar"><i/><i/><i/><i/></div><div className="illus-content"><div className="illus-title"/><div className="illus-stats"><i/><i/><i/></div><div className="illus-chart"><svg viewBox="0 0 300 75" preserveAspectRatio="none"><path d="M0 61 C20 53 26 31 48 43 S75 61 92 38 S123 15 146 31 S177 49 198 25 S233 43 254 17 S286 25 300 5" fill="none" stroke="currentColor" strokeWidth="2.5"/><path d="M0 61 C20 53 26 31 48 43 S75 61 92 38 S123 15 146 31 S177 49 198 25 S233 43 254 17 S286 25 300 5 V75 H0Z" fill="currentColor" opacity=".08"/></svg></div><div className="illus-bottom"><i/><i/><i/><i/></div></div></div></div><div className="floating-status"><span className="server-dot"/><div><b>All systems personal.</b><small>Your VPS · Your rules.</small></div><CheckCircle2 size={18}/></div></div><div className="auth-trust"><span><ShieldCheck size={15}/> Self-hosted</span><span><LockKeyhole size={15}/> Private by default</span><span><HardDrive size={15}/> Your storage</span></div></div></div><div className="auth-right"><div className="auth-form-shell"><div className="mobile-auth-brand"><Brand/></div><span className="auth-step">{mode==='setup'?'FIRST-TIME SETUP':mode==='register'?'NEW ACCOUNT':mode==='forgot'||mode==='resend'?'ACCOUNT RECOVERY':mode==='reset'?'PASSWORD RESET':mode==='verify'?'EMAIL VERIFICATION':'SECURE WORKSPACE'}</span><h2>{heading}</h2><p className="auth-subtitle">{subtitle}</p>
       {setupRequired&&!setupKeyConfigured&&<div className="inline-alert danger-alert auth-alert"><CircleAlert size={18}/><div><b>Setup key not configured</b><span>Set NODEBASE_SETUP_KEY in your server environment, then reload this page.</span></div></div>}
-      {error&&<div className="form-error"><CircleAlert size={16}/>{error}</div>}
-      <form className="auth-form" onSubmit={e=>{e.preventDefault();if(mode==='setup')onSubmit({setupKey,username,email,displayName:displayName||username,password},'setup');else onSubmit({username,password},'login')}}>
+      {error&&<div className="form-error"><CircleAlert size={16}/>{error}</div>}{message&&<div className="inline-alert info-alert auth-alert"><CheckCircle2 size={18}/><div><b>Request received</b><span>{message}</span></div></div>}
+      <form className="auth-form" onSubmit={submit}>
       {mode==='setup'&&<><label>One-time setup key<div className="input-wrap"><KeyRound size={17}/><input type="password" required value={setupKey} onChange={e=>setSetupKey(e.target.value)} placeholder="From NODEBASE_SETUP_KEY" autoComplete="off"/></div></label><div className="form-two"><label>Username<div className="input-wrap"><User size={17}/><input required minLength={3} maxLength={40} autoComplete="username" value={username} onChange={e=>setUsername(e.target.value)} placeholder="yourname"/></div></label><label>Display name<div className="input-wrap"><User size={17}/><input required maxLength={80} value={displayName} onChange={e=>setDisplayName(e.target.value)} placeholder="Your name"/></div></label></div><label>Email address<div className="input-wrap"><FileText size={17}/><input required type="email" autoComplete="email" value={email} onChange={e=>setEmail(e.target.value)} placeholder="you@example.com"/></div></label></>}
+      {mode==='register'&&<><div className="form-two"><label>Username<div className="input-wrap"><User size={17}/><input required minLength={3} maxLength={40} autoComplete="username" value={username} onChange={e=>setUsername(e.target.value)} placeholder="yourname"/></div></label><label>Display name<div className="input-wrap"><User size={17}/><input required minLength={2} maxLength={80} value={displayName} onChange={e=>setDisplayName(e.target.value)} placeholder="Your name"/></div></label></div><label>Email address<div className="input-wrap"><FileText size={17}/><input required type="email" autoComplete="email" value={email} onChange={e=>setEmail(e.target.value)} placeholder="you@example.com"/></div></label></>}
+      {mode==='verify'&&!verificationToken&&<div className="form-error"><CircleAlert size={16}/>The verification link is missing or invalid. Request a new link from sign in.</div>}
       {mode==='login'&&<label>Username or email<div className="input-wrap"><User size={17}/><input required autoComplete="username" value={username} onChange={e=>setUsername(e.target.value)} placeholder="Enter your username or email"/></div></label>}
-      <label>Password<div className="input-wrap"><LockKeyhole size={17}/><input type={showPassword?'text':'password'} required minLength={mode==='setup'?12:1} autoComplete={mode==='setup'?'new-password':'current-password'} value={password} onChange={e=>setPassword(e.target.value)} placeholder={mode==='setup'?'At least 12 characters':'Your password'}/><button type="button" className="input-end-action" onClick={()=>setShowPassword(!showPassword)}>{showPassword?<Eye size={16}/>:<Eye size={16}/>}</button></div>{mode==='setup'&&<small className="field-hint">Use 12+ characters. The password is stored as a salted scrypt hash.</small>}</label>
-      <Button type="submit" kind="primary" className="auth-submit" disabled={loading||(mode==='setup'&&!setupKeyConfigured)}>{loading?<><LoaderCircle size={17} className="spin"/> {mode==='setup'?'Creating workspace…':'Signing in…'}</>:<>{mode==='setup'?'Create secure workspace':'Sign in to NODEBASE'} <ArrowRight size={17}/></>}</Button>
-      </form><div className="auth-bottom-note"><ShieldCheck size={16}/><span>{mode==='setup'?'Setup is protected by a one-time server key. No default account is created.':'This is your private, self-hosted administrator account.'}</span></div></div><div className="auth-copyright">NODEBASE <span>·</span> Personal infrastructure, simplified.</div></div></div>;
+      {(mode==='forgot'||mode==='resend')&&<label>Email address<div className="input-wrap"><FileText size={17}/><input required type="email" autoComplete="email" value={email} onChange={e=>setEmail(e.target.value)} placeholder="you@example.com"/></div></label>}
+      {(mode==='login'||mode==='setup'||mode==='register'||mode==='reset')&&<label>{mode==='reset'?'New password':'Password'}<div className="input-wrap"><LockKeyhole size={17}/><input type={showPassword?'text':'password'} required minLength={mode==='setup'||mode==='register'||mode==='reset'?12:1} autoComplete={mode==='login'?'current-password':'new-password'} value={password} onChange={e=>setPassword(e.target.value)} placeholder={mode==='login'?'Your password':'At least 12 characters'}/><button type="button" className="input-end-action" onClick={()=>setShowPassword(!showPassword)} aria-label="Toggle password visibility"><Eye size={16}/></button></div>{mode!=='login'&&<small className="field-hint">Use 12+ characters. Passwords are stored with salted scrypt hashing.</small>}</label>}
+      {(mode==='register'||mode==='reset'||mode==='setup')&&<label>Confirm password<div className="input-wrap"><LockKeyhole size={17}/><input type={showPassword?'text':'password'} required minLength={12} autoComplete="new-password" value={passwordConfirmation} onChange={e=>setPasswordConfirmation(e.target.value)} placeholder="Re-enter your password"/></div></label>}
+      <Button type="submit" kind="primary" className="auth-submit" disabled={loading||(mode==='setup'&&!setupKeyConfigured)||(mode==='reset'&&!resetToken)||(mode==='verify'&&!verificationToken)}>{loading?<><LoaderCircle size={17} className="spin"/> Processing…</>:<>{mode==='setup'?'Create secure workspace':mode==='register'?'Create account':mode==='forgot'?'Send reset link':mode==='resend'?'Resend verification':mode==='reset'?'Update password':mode==='verify'?'Verify email':'Sign in to NODEBASE'} <ArrowRight size={17}/></>}</Button>
+      </form>
+      <div className="auth-mode-links">{mode==='login'&&!setupRequired&&<><button onClick={()=>{setMessage('');setMode('register')}}>Create an account</button><button onClick={()=>{setMessage('');setMode('forgot')}}>Forgot password?</button><button onClick={()=>{setMessage('');setMode('resend')}}>Resend verification</button></>}{(mode==='register'||mode==='forgot'||mode==='resend'||mode==='reset'||mode==='verify')&&<button onClick={()=>{setMessage('');setMode('login')}}>Back to sign in</button>}</div>
+      <div className="auth-bottom-note"><ShieldCheck size={16}/><span>{mode==='setup'?'Setup is protected by a one-time server key. No default account is created.':mode==='register'?'A personal organization is created automatically. Email verification is required before sign-in.':mode==='verify'?'This link is single-use. It is only consumed when you submit this confirmation.':'Private account access with session controls and server-side authorization.'}</span></div></div><div className="auth-copyright">NODEBASE <span>·</span> Personal infrastructure, simplified.</div></div></div>;
 }
 function Modal({title,description,children,onClose,wide=false}:{title:string;description?:string;children:React.ReactNode;onClose:()=>void;wide?:boolean}){useEffect(()=>{const handler=(e:KeyboardEvent)=>{if(e.key==='Escape')onClose()};window.addEventListener('keydown',handler);return()=>window.removeEventListener('keydown',handler)},[onClose]);return <div className="modal-backdrop" onMouseDown={e=>{if(e.target===e.currentTarget)onClose()}}><div className={`modal ${wide?'modal-wide':''}`} role="dialog" aria-modal="true"><div className="modal-header"><div><h3>{title}</h3>{description&&<p>{description}</p>}</div><button className="icon-btn" onClick={onClose} aria-label="Close"><X size={18}/></button></div><div className="modal-body">{children}</div></div></div>}
 function BotModal({onClose,onCreated,ping}:{onClose:()=>void;onCreated:(id:string)=>void;ping:(msg:string,type?:'success'|'error'|'info')=>void}){

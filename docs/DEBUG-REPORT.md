@@ -1,33 +1,21 @@
-# NODEBASE V2 foundation — debug report
+# NODEBASE V4 foundation — debug report
 
-## Fixed in this revision
+## Defects fixed in this revision
 
-The node heartbeat handler now re-checks the SHA-256 hash of the bearer credential in the SQL `UPDATE` itself and excludes revoked records. This prevents an in-flight heartbeat from changing a node back to `online` after an administrator revokes its credential. The update also uses a SQL `CASE` expression to preserve `draining` if a heartbeat overlaps an administrator's drain action.
+1. **SMTP settings were not passed into the panel container.** The root `.env.example` documented SMTP variables, but the `panel` service in `docker-compose.yml` did not forward them. Docker Compose does not automatically inject arbitrary host `.env` values into a service. This made registration, recovery, and organization invitations report email delivery as unavailable even when SMTP values existed in the deployment environment. The panel service now explicitly receives all six SMTP settings.
+2. **Email verification consumption is now transactionally single-use.** Token lookup, expiry/used checks, token consumption, and account verification now happen inside one SQLite transaction. Both conditional updates are checked for exactly one changed row. This closes the concurrent-request race where multiple confirmation POSTs could be treated as successful. A replay regression assertion was added to the API test.
 
-A backend API regression test now verifies that a node remains `draining` while heartbeats continue.
+## Checks performed for this debug pass
 
-## Checks performed in this workspace
+- V4 ZIP integrity: passed (`unzip -t`).
+- SQLite migrations 001–004: passed against a V3-shaped in-memory database.
+- Legacy administrator, session, bot, folder, file, backup, and activity rows: preserved; V3 records were assigned to the legacy personal organization.
+- Compatibility triggers: verified that post-migration V3-style inserts receive the legacy organization ID.
+- `PRAGMA foreign_key_check`: passed with no violations in the fixture.
+- `docker-compose.yml`: SMTP variables now explicitly forwarded to the panel.
+- Full TypeScript/build/API tests: **not completed**. `npm install` timed out in this environment and workspace dependencies/types are absent, so `tsc` reports missing Node/React package declarations. Those are environment blockers, not successful checks. Run the documented install/build/test commands in a network-enabled environment before staging deployment.
+- No Docker image build, live database migration, GitHub push, or VPS deployment was performed.
 
-- `git diff --check`: passed.
-- TypeScript/TSX parser pass across 15 source and test files: passed with no syntax diagnostics. This is not a full typecheck.
-- Node agent strict TypeScript check: passed using the globally available TypeScript compiler and Node type declarations; the missing `dotenv/config` declaration was supplied as a temporary local type shim, not committed.
-- Node agent config tests: 3 passed, 0 failed.
-- SQLite migration smoke test: `001_initial.sql` and `002_nodes.sql` both applied successfully.
-- SQLite heartbeat regression smoke test: verified that a draining status stays draining and a revoked credential cannot update the node.
-- `npm run typecheck`, `npm run build`, and `npm test`: could not complete because this environment has no installed workspace dependencies. `npm install` could not resolve `registry.npmjs.org` (`EAI_AGAIN`). Reported missing `react`, Node type definitions, and `tsx` therefore reflect unavailable dependencies, not confirmed source defects.
-- Docker image build: not run in this workspace.
+## Remaining boundaries
 
-Run the complete workspace checks in Termux only if your environment can install native dependencies successfully, or preferably in GitHub Actions / the VPS build environment with npm registry access:
-
-```bash
-npm install --no-audit --no-fund
-npm run typecheck
-npm run build
-npm test
-```
-
-Do not deploy the branch until those checks pass in a dependency-enabled environment.
-
-## Current implementation boundary
-
-This branch implements the first multi-node registration and telemetry foundation: one-time enrollment, per-node hashed credentials, outbound HTTPS heartbeats, node freshness state, and admin drain/revoke actions. It does **not** yet implement remote bot deployment, command delivery/acknowledgement, workload scheduling, remote logs, or PostgreSQL migration. The single-host V1 runner remains the only bot lifecycle executor.
+This is still the account and organization foundation only. Tenant-scoped bot/file/node/backup/usage/Watch routes, the full file manager, platform admin console, and production end-to-end testing remain incomplete. Do not deploy this as a completed V4 release.

@@ -2,7 +2,7 @@
   "name": "nodebase",
   "version": "0.1.0",
   "private": true,
-  "description": "Self-hosted Discord bot hosting and personal file cloud",
+  "description": "Self-hosted multi-tenant infrastructure and Discord bot hosting platform",
   "workspaces": [
     "frontend",
     "backend",
