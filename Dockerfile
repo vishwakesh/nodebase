@@ -5,6 +5,7 @@ COPY package.json ./
 COPY frontend/package.json frontend/package.json
 COPY backend/package.json backend/package.json
 COPY runner/package.json runner/package.json
+COPY agent/package.json agent/package.json
 RUN npm install --no-audit --no-fund
 COPY . .
 RUN npm run build

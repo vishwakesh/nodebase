@@ -1,12 +1,36 @@
-# NODEBASE
+# NODEBASE V4 Foundation — Development Snapshot
 
-**A self-hosted Discord bot workspace and private file cloud.** NODEBASE is designed for one administrator on one VPS, with a React dashboard, a Fastify API, SQLite metadata, private disk-backed file objects, and a separate authenticated Docker runner.
+**Build. Debug. Deploy. Organize. Connect.**
+
+This development snapshot is based on the `feat/nodebase-watch` branch and the V3 Obsidian + Acid Lime workspace foundation (`feat/nodebase-v3-workspace`) and approved V2 multi-node foundation. It retains the existing hosting, nodes, bot workspaces, backups, activity, Cloud screens, balanced layout primitives, and System/Light/Dark theme behavior.
+
+The Watch increment adds a Watch alpha: Cloud-backed MP4/WebM library discovery, private and discoverable-private rooms, hashed invitations, room-scoped guest sessions, progressive byte-range playback, server-stored playback state, room chat, and queue foundations. HLS transcoding, resumable multipart uploads, authenticated segment delivery, WebSocket synchronization, and production media analytics are not yet implemented. See [`docs/watch/IMPLEMENTATION-STATUS.md`](docs/watch/IMPLEMENTATION-STATUS.md), [`docs/watch/PRD.md`](docs/watch/PRD.md), and [`docs/watch/ARCHITECTURE.md`](docs/watch/ARCHITECTURE.md). AI Builder, NVIDIA provider workflows, Bug Hunter, Auto Fixer, Auto Setup, and Notes remain future V3 modules. This branch is not a production-complete streaming release.
+
+**Existing foundation:** A self-hosted Discord bot workspace and private file cloud. The current implementation uses a React dashboard, Fastify API, SQLite metadata, private disk-backed file objects, and a separate authenticated Docker runner.
+
+**V4 rollout boundary:** This increment provides multi-account identity and organization foundations. The existing V3 hosting/file/Watch control plane remains protected for platform administrators only until its queries are migrated to enforce organization ownership. New members are not allowed into those unscoped handlers.
 
 > **Deployment status:** This repository is a fresh implementation. It has not been deployed to your VPS from this workspace. Run the build and test steps below, then deploy through your existing Coolify instance. The bot runner requires Docker socket access on the host and is deliberately kept on a private Compose network.
 
+## Preserved V2 multi-node foundation
+
+The branch `feat/nodebase-v2-foundation` introduces a first multi-node connectivity slice while preserving the existing V1 flow:
+
+- Add a Hosting Nodes section to the mobile-responsive panel.
+- Issue 15-minute, single-use enrollment tokens for authenticated administrators.
+- Enroll a remote node agent over HTTPS and exchange the enrollment secret for a unique credential.
+- Store only hashes of enrollment and node credentials on the control plane.
+- Report node heartbeats and real host CPU, memory, disk, and declared runtime telemetry.
+- Mark nodes offline when heartbeats are older than 90 seconds; expose drain, re-enable, and credential-revoke controls.
+
+This is an incremental foundation, not a claim that remote bot lifecycle scheduling is complete. The node agent currently reports connectivity and telemetry. Remote bot container creation, command acknowledgements, remote logs, and placement/scheduling remain future work. See [`docs/V2-ARCHITECTURE.md`](docs/V2-ARCHITECTURE.md) for the current scope and agent installation guide.
+
 ## Included in this MVP
 
-- First-run admin setup protected by `NODEBASE_SETUP_KEY`; no default account, no public registration.
+- First-run platform-admin setup protected by `NODEBASE_SETUP_KEY`; no default account.
+- V4 account registration with SMTP email verification, login eligibility checks, password recovery, single-use hashed tokens, and personal organization creation.
+- V4 team organization management: role-based memberships, email invitations, invitation acceptance, member removal, and ownership transfer for team organizations.
+- V4 account sessions and organization APIs are available to member accounts. Existing V3 resource APIs remain blocked for regular members until each resource handler enforces tenant ownership.
 - Scrypt password hashes, expiring HTTP-only session cookies, CSRF double-submit protection, login rate limiting, security headers, and server-side authorization.
 - Overview dashboard, real host/container metrics where available, recent activity, and a responsive light-mode workspace with a dark theme option.
 - Python and Node.js bot project creation/import from ZIP; safe extraction filters traversal, ZIP symlinks, private environment files and common private-key files.
@@ -142,6 +166,8 @@ Use a harmless test project (for example, a bot that logs a message then exits) 
 
 ## Environment variables
 
+V4 email verification, recovery, and organization invitations require a working SMTP provider. Configure `SMTP_HOST`, `SMTP_PORT`, `SMTP_SECURE`, `SMTP_USER`, `SMTP_PASSWORD`, `SMTP_FROM`, and the exact `FRONTEND_ORIGIN`. When SMTP is missing, registration and email-based recovery/invitations return an explicit service-unavailable response; the application does not pretend an email was sent.
+
 | Variable | Purpose | Default / requirement |
 |---|---|---|
 | `NODEBASE_SETUP_KEY` | One-time first-admin setup guard | Required in production, 32+ random characters |
@@ -183,7 +209,7 @@ If npm cannot download packages on the machine where you are running these comma
 - ZIP bot imports exclude `.env`, most `.env.*` files, private-key extensions and symlinks; create secrets in the Environment tab instead. Backups also omit `.env` files and common dependency/build directories.
 - The runner supports Python and Node images, basic dependency detection (`requirements.txt`, `package.json`), startup commands, restart policy, logs, status and resource stats. Some bots need native build tools, a specific runtime version, unusual OS libraries, or ports; those requirements need explicit implementation before running such projects.
 - Bot source editing is not a general code editor in this MVP. Bot files can be browsed/downloaded, and startup/environment configuration can be managed in the panel.
-- No billing, public registration, multi-user tenancy, public file sharing, or payment processing is included.
+- Billing, payment processing, organization-level bot/file/node/Watch resource access, and public file sharing are not implemented in this V4 foundation increment. Tenant ownership columns are backfilled for existing V3 records, but resource handlers are still platform-admin-only until each module is fully scoped.
 - A backup restore requires a healthy runner if a container may exist; the API stops the bot before replacing source files.
 - Back up the persistent data directory using a trusted host-level backup process before upgrading the app or changing secrets.
 

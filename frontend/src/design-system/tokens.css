@@ -1,0 +1,183 @@
+/* NODEBASE V3 — Obsidian + Acid Lime design tokens.
+   Semantic aliases keep existing V2 components compatible during the V3 migration. */
+:root {
+  color-scheme: light;
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+
+  /* Brand */
+  --brand-obsidian-deep: #0B0F0C;
+  --brand-obsidian: #111411;
+  --brand-graphite: #202820;
+  --brand-graphite-soft: #29352A;
+  --brand-acid-lime: #B6F36B;
+  --brand-lime-hover: #A5E651;
+  --brand-lime-pressed: #8FCB3E;
+  --brand-lime-tint: #EFF8DF;
+  --brand-sage: #78C8A0;
+  --brand-warm-ivory: #E8D9B5;
+
+  /* Light semantic surfaces */
+  --color-bg: #F6F8F3;
+  --color-surface: #FFFFFF;
+  --color-surface-secondary: #EDF1E9;
+  --color-surface-elevated: #FFFFFF;
+  --color-surface-hover: #F0F4EA;
+  --color-text-primary: #172016;
+  --color-text-secondary: #596653;
+  --color-text-muted: #75816F;
+  --color-border: #DFE6D8;
+  --color-border-strong: #C9D4C0;
+  --color-action: #B6F36B;
+  --color-action-hover: #A5E651;
+  --color-action-pressed: #8FCB3E;
+  --color-action-text: #172016;
+  --color-focus: #648E35;
+
+  /* Status */
+  --color-success: #23834B;
+  --color-success-soft: #E8F5EC;
+  --color-warning: #B7791F;
+  --color-warning-soft: #FBF2DF;
+  --color-danger: #C24141;
+  --color-danger-soft: #FCEBEC;
+  --color-info: #3576B8;
+  --color-info-soft: #E8F1FA;
+  --color-offline: #697568;
+
+  /* Balanced workspace layout */
+  --sidebar-width: 248px;
+  --sidebar-collapsed-width: 76px;
+  --header-height: 64px;
+  --header-height-mobile: 56px;
+  --content-max-width: 1440px;
+  --page-padding-x: 32px;
+  --page-padding-y: 28px;
+
+  /* 4px spacing scale */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --space-10: 40px;
+
+  /* Shape and depth */
+  --radius-sm: 7px;
+  --radius-md: 10px;
+  --radius-lg: 12px;
+  --radius-xl: 16px;
+  --radius-2xl: 20px;
+  --shadow-card: 0 1px 2px rgba(23, 32, 22, .04), 0 8px 24px rgba(23, 32, 22, .035);
+  --shadow-popover: 0 16px 40px rgba(23, 32, 22, .14);
+  --motion-fast: 120ms;
+  --motion-normal: 180ms;
+
+  /* Compatibility aliases for the existing V2 screen styles. */
+  --bg: var(--color-bg);
+  --surface: var(--color-surface);
+  --surface-soft: var(--color-surface-secondary);
+  --surface-hover: var(--color-surface-hover);
+  --text: var(--color-text-primary);
+  --text-strong: var(--color-text-primary);
+  --muted: var(--color-text-secondary);
+  --muted-2: var(--color-text-muted);
+  --line: var(--color-border);
+  --line-strong: var(--color-border-strong);
+  --indigo: var(--brand-acid-lime);
+  --indigo-dark: var(--brand-lime-pressed);
+  --blue: var(--color-info);
+  --green: var(--color-success);
+  --green-soft: var(--color-success-soft);
+  --red: var(--color-danger);
+  --red-soft: var(--color-danger-soft);
+  --orange: var(--color-warning);
+  --orange-soft: var(--color-warning-soft);
+  --purple: #66705D;
+  --shadow: var(--shadow-card);
+  --radius: var(--radius-lg);
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --color-bg: #0B0F0C;
+  --color-surface: #111411;
+  --color-surface-secondary: #182019;
+  --color-surface-elevated: #202820;
+  --color-surface-hover: #202820;
+  --color-text-primary: #F5F7F2;
+  --color-text-secondary: #C1CCBB;
+  --color-text-muted: #91A08D;
+  --color-border: #2C382D;
+  --color-border-strong: #3D4C3C;
+  --color-action: #B6F36B;
+  --color-action-hover: #C5FA85;
+  --color-action-pressed: #A5E651;
+  --color-action-text: #172016;
+  --color-focus: #B6F36B;
+  --color-success: #7EE09C;
+  --color-success-soft: #183323;
+  --color-warning: #F3C66B;
+  --color-warning-soft: #392D16;
+  --color-danger: #FF8585;
+  --color-danger-soft: #3A2020;
+  --color-info: #8AC7FF;
+  --color-info-soft: #1B2E3D;
+  --color-offline: #9AA69A;
+  --shadow-card: 0 1px 2px rgba(0, 0, 0, .22), 0 10px 28px rgba(0, 0, 0, .12);
+  --shadow-popover: 0 18px 44px rgba(0, 0, 0, .42);
+  --bg: var(--color-bg);
+  --surface: var(--color-surface);
+  --surface-soft: var(--color-surface-secondary);
+  --surface-hover: var(--color-surface-hover);
+  --text: var(--color-text-primary);
+  --text-strong: var(--color-text-primary);
+  --muted: var(--color-text-secondary);
+  --muted-2: var(--color-text-muted);
+  --line: var(--color-border);
+  --line-strong: var(--color-border-strong);
+  --indigo: var(--brand-acid-lime);
+  --indigo-dark: var(--brand-lime-hover);
+  --blue: var(--color-info);
+  --green: var(--color-success);
+  --green-soft: var(--color-success-soft);
+  --red: var(--color-danger);
+  --red-soft: var(--color-danger-soft);
+  --orange: var(--color-warning);
+  --orange-soft: var(--color-warning-soft);
+  --purple: #B6F36B;
+  --shadow: var(--shadow-card);
+}
+
+html, body, #root { min-height: 100%; }
+html { background: var(--color-bg); }
+body {
+  min-width: 320px;
+  min-height: 100vh;
+  margin: 0;
+  background: var(--color-bg);
+  color: var(--color-text-primary);
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-size: 14px;
+  transition: background-color var(--motion-normal) ease, color var(--motion-normal) ease;
+}
+*, *::before, *::after { box-sizing: border-box; }
+button, input, select, textarea { font: inherit; }
+button { color: inherit; }
+:focus-visible { outline: 2px solid var(--color-focus); outline-offset: 2px; }
+code, kbd, pre { font-family: "Geist Mono", ui-monospace, SFMono-Regular, Consolas, monospace; }
+
+@media (max-width: 850px) {
+  :root { --page-padding-x: 18px; --page-padding-y: 24px; }
+}
+@media (max-width: 600px) {
+  :root { --page-padding-x: 16px; --page-padding-y: 20px; }
+  body { font-size: 13px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
+}

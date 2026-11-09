@@ -8,10 +8,12 @@ let db: any;
 let cookie = '';
 let csrf = '';
 let storageRoot = '/tmp/nodebase-test-storage';
+let blobRoot = '/tmp/nodebase-test-storage/file-blobs';
 
 before(async () => {
   const configModule = await import('../src/config.js');
   storageRoot = configModule.config.storageRoot;
+  blobRoot = configModule.config.blobRoot;
   await fs.rm(storageRoot, { recursive: true, force: true });
   const server = await import('../src/server.js');
   app = server.app;
@@ -78,5 +80,287 @@ test('uploaded files stay private and can be downloaded through an authorized ro
 
 test('database schema is tracked through a versioned migration', () => {
   const applied = db.prepare('SELECT version FROM schema_migrations ORDER BY version').all().map((row: any) => row.version);
-  assert.deepEqual(applied, ['001_initial.sql']);
+  assert.deepEqual(applied, ['001_initial.sql', '002_nodes.sql', '003_watch.sql', '004_v4_accounts_organizations.sql']);
+});
+
+
+test('email verification GET is non-consuming and explicit POST verifies the single-use token', async () => {
+  const { randomUUID } = await import('node:crypto');
+  const { randomToken, sha256 } = await import('../src/security.js');
+  const userId = randomUUID();
+  const rawToken = randomToken(32);
+  const now = new Date().toISOString();
+  db.prepare(`INSERT INTO admin(id,username,email,display_name,password_hash,created_at,platform_role,account_status,email_verified_at)
+    VALUES(?,?,?,?,?,?,'member','active',NULL)`).run(userId, `verify-${userId.slice(0,8)}`, `verify-${userId.slice(0,8)}@example.test`, 'Verify Test', 'scrypt$unused$unused', now);
+  const tokenId = randomUUID();
+  db.prepare('INSERT INTO email_verification_tokens(id,user_id,token_hash,expires_at,created_at) VALUES(?,?,?,?,?)')
+    .run(tokenId, userId, sha256(rawToken), new Date(Date.now()+3600000).toISOString(), now);
+
+  const landing = await app.inject({ method: 'GET', url: `/api/auth/verify-email?token=${encodeURIComponent(rawToken)}` });
+  assert.equal(landing.statusCode, 302, landing.body);
+  assert.equal(db.prepare('SELECT email_verified_at FROM admin WHERE id=?').get(userId).email_verified_at, null);
+  assert.equal(db.prepare('SELECT used_at FROM email_verification_tokens WHERE id=?').get(tokenId).used_at, null);
+
+  const confirmed = await app.inject({ method: 'POST', url: '/api/auth/verify-email', headers: { cookie: `nb_csrf=${csrf}`, 'x-csrf-token': csrf, 'content-type': 'application/json' }, payload: { token: rawToken } });
+  assert.equal(confirmed.statusCode, 200, confirmed.body);
+  assert.ok(db.prepare('SELECT email_verified_at FROM admin WHERE id=?').get(userId).email_verified_at);
+  assert.ok(db.prepare('SELECT used_at FROM email_verification_tokens WHERE id=?').get(tokenId).used_at);
+
+  const replay = await app.inject({ method: 'POST', url: '/api/auth/verify-email', headers: { cookie: `nb_csrf=${csrf}`, 'x-csrf-token': csrf, 'content-type': 'application/json' }, payload: { token: rawToken } });
+  assert.equal(replay.statusCode, 400, 'a verification token cannot be consumed twice');
+});
+
+test('V4 organization boundaries hide unrelated organizations and block unscoped V3 resources for members', async () => {
+  const { randomUUID } = await import('node:crypto');
+  const { randomToken, sha256 } = await import('../src/security.js');
+  const userId = randomUUID();
+  const organizationId = randomUUID();
+  const now = new Date().toISOString();
+  db.prepare(`INSERT INTO admin(id,username,email,display_name,password_hash,created_at,platform_role,account_status,email_verified_at)
+    VALUES(?,?,?,?,? ,?,'member','active',?)`).run(userId, 'membertest', 'member@example.test', 'Member Test', 'scrypt$unused$unused', now, now);
+  db.prepare(`INSERT INTO organizations(id,name,slug,description,type,owner_user_id,created_at,updated_at) VALUES(?,?,?,'','team',?,?,?)`)
+    .run(organizationId, 'Member Team', `team-${userId.slice(0,8)}`, userId, now, now);
+  db.prepare(`INSERT INTO organization_memberships(organization_id,user_id,role,status,joined_at,created_at,updated_at) VALUES(?,?,'owner','active',?,?,?)`)
+    .run(organizationId, userId, now, now, now);
+  const sessionToken = randomToken();
+  db.prepare(`INSERT INTO sessions(id,token_hash,csrf_token,user_id,expires_at,created_at,user_agent,ip) VALUES(?,?,?,?,?,?,?,?)`)
+    .run(randomUUID(), sha256(sessionToken), csrf, userId, new Date(Date.now()+3600000).toISOString(), now, 'test', '127.0.0.1');
+  const memberCookie = `nb_session=${sessionToken}; nb_csrf=${csrf}`;
+
+  // Regular members can revoke their other device sessions; this nested route must not be blocked by the legacy API guard.
+  const otherSessionId = randomUUID();
+  db.prepare(`INSERT INTO sessions(id,token_hash,csrf_token,user_id,expires_at,created_at,user_agent,ip) VALUES(?,?,?,?,?,?,?,?)`)
+    .run(otherSessionId, sha256(randomToken()), csrf, userId, new Date(Date.now()+3600000).toISOString(), now, 'second device', '127.0.0.1');
+  const revoked = await app.inject({ method: 'DELETE', url: `/api/auth/sessions/${otherSessionId}`, headers: { cookie: memberCookie, 'x-csrf-token': csrf } });
+  assert.equal(revoked.statusCode, 204, revoked.body);
+
+  const listed = await app.inject({ method: 'GET', url: '/api/organizations', headers: { cookie: memberCookie } });
+  assert.equal(listed.statusCode, 200, listed.body);
+  assert.equal(listed.json().organizations.length, 1);
+  assert.equal(listed.json().organizations[0].id, organizationId);
+
+  const foreign = await app.inject({ method: 'GET', url: `/api/organizations/${db.prepare('SELECT id FROM organizations WHERE owner_user_id<>? LIMIT 1').get(userId)?.id ?? randomUUID()}`, headers: { cookie: memberCookie } });
+  assert.equal(foreign.statusCode, 404, foreign.body);
+
+  const legacy = await app.inject({ method: 'GET', url: '/api/files', headers: { cookie: memberCookie } });
+  assert.equal(legacy.statusCode, 403, legacy.body);
+  assert.equal(legacy.json().error.code, 'V4_MODULE_NOT_READY');
+
+  const created = await app.inject({ method: 'POST', url: '/api/organizations', headers: { cookie: memberCookie, 'x-csrf-token': csrf, 'content-type': 'application/json' }, payload: { name: 'Second Team', description: 'Created through the V4 API' } });
+  assert.equal(created.statusCode, 201, created.body);
+  assert.equal(created.json().organization.role, 'owner');
+
+  const viewerId = randomUUID();
+  db.prepare(`INSERT INTO admin(id,username,email,display_name,password_hash,created_at,platform_role,account_status,email_verified_at)
+    VALUES(?,?,?,?,? ,?,'member','active',?)`).run(viewerId, `viewer-${userId.slice(0,6)}`, `viewer-${userId.slice(0,6)}@example.test`, 'Viewer Test', 'scrypt$unused$unused', now, now);
+  db.prepare(`INSERT INTO organization_memberships(organization_id,user_id,role,status,joined_at,created_at,updated_at) VALUES(?,?,'viewer','active',?,?,?)`)
+    .run(organizationId, viewerId, now, now, now);
+  const viewerToken = randomToken();
+  db.prepare(`INSERT INTO sessions(id,token_hash,csrf_token,user_id,expires_at,created_at,user_agent,ip) VALUES(?,?,?,?,?,?,?,?)`)
+    .run(randomUUID(), sha256(viewerToken), csrf, viewerId, new Date(Date.now()+3600000).toISOString(), now, 'viewer test', '127.0.0.1');
+  const viewerInvite = await app.inject({ method: 'POST', url: `/api/organizations/${organizationId}/invitations`, headers: { cookie: `nb_session=${viewerToken}; nb_csrf=${csrf}`, 'x-csrf-token': csrf, 'content-type': 'application/json' }, payload: { email: 'someone@example.test', role: 'viewer' } });
+  assert.equal(viewerInvite.statusCode, 403, viewerInvite.body);
+});
+
+
+test('node enrollment tokens are single-use and agent heartbeats update real node telemetry', async () => {
+  const tokenRes = await app.inject({
+    method: 'POST', url: '/api/nodes/enrollment-tokens',
+    headers: { cookie, 'x-csrf-token': csrf, 'content-type': 'application/json' },
+    payload: { label: 'Test remote node' },
+  });
+  assert.equal(tokenRes.statusCode, 201, tokenRes.body);
+  const enrollmentToken = tokenRes.json().token;
+  assert.equal(typeof enrollmentToken, 'string');
+  assert.ok(enrollmentToken.length >= 32);
+
+  const enrolled = await app.inject({
+    method: 'POST', url: '/api/agent/enroll',
+    headers: { authorization: `Bearer ${enrollmentToken}`, 'content-type': 'application/json' },
+    payload: { name: 'Test node', region: 'Test region', agentVersion: 'test-1', runtimes: ['python', 'node'], cpuCores: 4, memoryTotalBytes: 8_000_000_000, storageTotalBytes: 100_000_000_000 },
+  });
+  assert.equal(enrolled.statusCode, 201, enrolled.body);
+  const node = enrolled.json().node;
+  const nodeToken = enrolled.json().nodeToken;
+  assert.equal(node.name, 'Test node');
+  assert.equal(node.status, 'offline', 'enrollment is not treated as a heartbeat');
+  assert.ok(nodeToken.length >= 32);
+
+  const replay = await app.inject({
+    method: 'POST', url: '/api/agent/enroll',
+    headers: { authorization: `Bearer ${enrollmentToken}`, 'content-type': 'application/json' },
+    payload: { name: 'Replay node', region: '', agentVersion: 'test-1', runtimes: ['node'] },
+  });
+  assert.equal(replay.statusCode, 401);
+
+  const heartbeat = await app.inject({
+    method: 'POST', url: '/api/agent/heartbeat',
+    headers: { authorization: `Bearer ${nodeToken}`, 'content-type': 'application/json' },
+    payload: { agentVersion: 'test-1', cpuPercent: 23, memoryTotalBytes: 8_000_000_000, memoryUsedBytes: 2_000_000_000, storageTotalBytes: 100_000_000_000, storageUsedBytes: 40_000_000_000, workloadCount: 2, runtimes: ['python', 'node'] },
+  });
+  assert.equal(heartbeat.statusCode, 200, heartbeat.body);
+
+  const listed = await app.inject({ method: 'GET', url: '/api/nodes', headers: { cookie } });
+  assert.equal(listed.statusCode, 200, listed.body);
+  const found = listed.json().nodes.find((n: any) => n.id === node.id);
+  assert.equal(found.status, 'online');
+  assert.equal(found.cpuPercent, 23);
+  assert.equal(found.workloadCount, 2);
+  assert.equal(listed.body.includes(nodeToken), false);
+
+  const drained = await app.inject({
+    method: 'POST', url: `/api/nodes/${node.id}/drain`,
+    headers: { cookie, 'x-csrf-token': csrf }, payload: {},
+  });
+  assert.equal(drained.statusCode, 200);
+  const heartbeatWhileDraining = await app.inject({
+    method: 'POST', url: '/api/agent/heartbeat',
+    headers: { authorization: `Bearer ${nodeToken}`, 'content-type': 'application/json' },
+    payload: { agentVersion: 'test-1', cpuPercent: 24, memoryTotalBytes: 8_000_000_000, memoryUsedBytes: 2_100_000_000, storageTotalBytes: 100_000_000_000, storageUsedBytes: 40_000_000_000, workloadCount: 2, runtimes: ['python', 'node'] },
+  });
+  assert.equal(heartbeatWhileDraining.statusCode, 200);
+  const drainingList = await app.inject({ method: 'GET', url: '/api/nodes', headers: { cookie } });
+  assert.equal(drainingList.json().nodes.find((n: any) => n.id === node.id).status, 'draining');
+
+  const unauthenticated = await app.inject({
+    method: 'POST', url: '/api/agent/heartbeat',
+    headers: { 'content-type': 'application/json' },
+    payload: { agentVersion: 'test-1', cpuPercent: 0, memoryTotalBytes: 1, memoryUsedBytes: 0, storageTotalBytes: 1, storageUsedBytes: 0, workloadCount: 0, runtimes: ['node'] },
+  });
+  assert.equal(unauthenticated.statusCode, 401);
+
+  db.prepare('UPDATE nodes SET last_heartbeat_at=? WHERE id=?').run(new Date(Date.now() - 120_000).toISOString(), node.id);
+  const stale = await app.inject({ method: 'GET', url: '/api/nodes', headers: { cookie } });
+  assert.equal(stale.json().nodes.find((n: any) => n.id === node.id).status, 'offline');
+
+  const revoked = await app.inject({ method: 'DELETE', url: `/api/nodes/${node.id}`, headers: { cookie, 'x-csrf-token': csrf } });
+  assert.equal(revoked.statusCode, 204);
+  const revokedHeartbeat = await app.inject({
+    method: 'POST', url: '/api/agent/heartbeat',
+    headers: { authorization: `Bearer ${nodeToken}`, 'content-type': 'application/json' },
+    payload: { agentVersion: 'test-1', cpuPercent: 0, memoryTotalBytes: 1, memoryUsedBytes: 0, storageTotalBytes: 1, storageUsedBytes: 0, runtimes: ['node'] },
+  });
+  assert.equal(revokedHeartbeat.statusCode, 401);
+});
+
+
+test('WATCH creates private rooms, issues scoped invitations, joins guests, and streams byte ranges', async () => {
+  const { randomUUID } = await import('node:crypto');
+  const fileId = randomUUID();
+  const blobName = randomUUID();
+  const media = Buffer.from('0123456789abcdefghijklmnopqrstuvwxyz');
+  await fs.mkdir(blobRoot, { recursive: true });
+  await fs.writeFile(path.join(blobRoot, blobName), media);
+  db.prepare('INSERT INTO files (id,name,folder_id,blob_name,size,mime_type,created_at,updated_at) VALUES (?,?,NULL,?,?,?,?,?)')
+    .run(fileId, 'watch-sample.mp4', blobName, media.length, 'video/mp4', new Date().toISOString(), new Date().toISOString());
+
+  const created = await app.inject({
+    method: 'POST', url: '/api/watch/rooms',
+    headers: { cookie, 'x-csrf-token': csrf, 'content-type': 'application/json' },
+    payload: { title: 'Private test room', videoFileId: fileId, visibility: 'discoverable_private', participantLimit: 4 },
+  });
+  assert.equal(created.statusCode, 201, created.body);
+  const roomId = created.json().room.id;
+  assert.equal(created.json().video.delivery, 'progressive');
+  assert.equal(created.json().room.visibility, 'discoverable_private');
+
+  const invitation = await app.inject({
+    method: 'POST', url: `/api/watch/rooms/${roomId}/invitations`,
+    headers: { cookie, 'x-csrf-token': csrf, 'content-type': 'application/json' },
+    payload: { expiresInHours: 1, maxUses: 1 },
+  });
+  assert.equal(invitation.statusCode, 201, invitation.body);
+  const token = invitation.json().invitation.token;
+  assert.ok(token.length >= 40);
+  assert.equal(invitation.body.includes(token), true, 'raw token is returned once to the creator');
+  const stored = (db.prepare('SELECT token_hash FROM watch_invitations WHERE id=?').get(invitation.json().invitation.id) as any).token_hash;
+  assert.notEqual(stored, token, 'only token hash is persisted');
+  const unauthenticatedRevoke = await app.inject({ method: 'DELETE', url: `/api/watch/invitations/${invitation.json().invitation.id}`, headers: { cookie: `nb_csrf=${csrf}`, 'x-csrf-token': csrf } });
+  assert.equal(unauthenticatedRevoke.statusCode, 401, 'invitation revocation requires an authenticated room owner');
+
+  const preview = await app.inject({ method: 'POST', url: '/api/watch/invitations/resolve', headers: { cookie: `nb_csrf=${csrf}`, 'x-csrf-token': csrf, 'content-type': 'application/json' }, payload: { token } });
+  assert.equal(preview.statusCode, 200, preview.body);
+  assert.equal(preview.json().room.title, 'Private test room');
+
+  const joinAttempts = await Promise.all([1, 2].map((n) => app.inject({
+    method: 'POST', url: '/api/watch/invitations/join',
+    headers: { cookie: `nb_csrf=${csrf}`, 'x-csrf-token': csrf, 'content-type': 'application/json' },
+    payload: { token, displayName: `Guest Viewer ${n}` },
+  })));
+  const joined = joinAttempts.find((attempt: any) => attempt.statusCode === 201);
+  const rejectedJoin = joinAttempts.find((attempt: any) => attempt.statusCode !== 201);
+  assert.ok(joined, 'one concurrent join consumes the one-use invitation');
+  assert.equal(rejectedJoin?.statusCode, 404, 'the competing join cannot exceed max uses');
+  assert.equal(joined.json().status, 'joined');
+  const setCookies = joined.headers['set-cookie'];
+  const cookieValues = (Array.isArray(setCookies) ? setCookies : [setCookies]).filter(Boolean).map((value: string) => value.split(';')[0]);
+  const watchCookie = cookieValues.find((value: string) => value.startsWith('nb_watch_'));
+  assert.ok(watchCookie, 'guest receives a room-scoped HttpOnly cookie');
+  const guestCookie = `${cookie}; ${watchCookie}`;
+
+  const guestRoom = await app.inject({ method: 'GET', url: `/api/watch/guest/${roomId}`, headers: { cookie: guestCookie } });
+  assert.equal(guestRoom.statusCode, 200, guestRoom.body);
+  assert.match(guestRoom.json().participant.displayName, /^Guest Viewer [12]$/);
+
+  const hostPlayback = await app.inject({
+    method: 'POST', url: `/api/watch/rooms/${roomId}/playback`,
+    headers: { cookie, 'x-csrf-token': csrf, 'content-type': 'application/json' },
+    payload: { action: 'play', positionMs: 12500 },
+  });
+  assert.equal(hostPlayback.statusCode, 200, hostPlayback.body);
+  assert.equal(hostPlayback.json().playback.state, 'playing');
+
+  const guestPlayback = await app.inject({ method: 'GET', url: `/api/watch/guest/${roomId}/playback`, headers: { cookie: guestCookie } });
+  assert.equal(guestPlayback.statusCode, 200, guestPlayback.body);
+  assert.equal(guestPlayback.json().playback.state, 'playing');
+  const guestCannotControl = await app.inject({
+    method: 'POST', url: `/api/watch/guest/${roomId}/playback`,
+    headers: { cookie: guestCookie, 'x-csrf-token': csrf, 'content-type': 'application/json' },
+    payload: { action: 'pause', positionMs: 12500 },
+  });
+  assert.equal(guestCannotControl.statusCode, 403, 'ordinary guests cannot change the host-controlled timeline');
+
+  const mediaRange = await app.inject({ method: 'GET', url: `/api/watch/guest/${roomId}/media`, headers: { cookie: guestCookie, range: 'bytes=0-4' } });
+  assert.equal(mediaRange.statusCode, 206, mediaRange.body);
+  assert.equal(mediaRange.body, '01234');
+  assert.equal(mediaRange.headers['content-range'], `bytes 0-4/${media.length}`);
+  const invalidRange = await app.inject({ method: 'GET', url: `/api/watch/guest/${roomId}/media`, headers: { cookie: guestCookie, range: 'bytes=-0' } });
+  assert.equal(invalidRange.statusCode, 416, 'zero-length suffix ranges are rejected');
+
+  const unauthenticatedMedia = await app.inject({ method: 'GET', url: `/api/watch/guest/${roomId}/media` });
+  assert.equal(unauthenticatedMedia.statusCode, 401);
+
+  const replay = await app.inject({ method: 'POST', url: '/api/watch/invitations/resolve', headers: { cookie: `nb_csrf=${csrf}`, 'x-csrf-token': csrf, 'content-type': 'application/json' }, payload: { token } });
+  assert.equal(replay.statusCode, 404, 'single-use invitation is no longer valid');
+  const leave = await app.inject({ method: 'POST', url: `/api/watch/guest/${roomId}/leave`, headers: { cookie: guestCookie, 'x-csrf-token': csrf, 'content-type': 'application/json' }, payload: {} });
+  assert.equal(leave.statusCode, 200);
+  const afterLeave = await app.inject({ method: 'GET', url: `/api/watch/guest/${roomId}`, headers: { cookie: guestCookie } });
+  assert.equal(afterLeave.statusCode, 401, 'leaving revokes the room-scoped guest session');
+});
+
+test('WATCH discovery lists only other hosts’ discoverable-private rooms', async () => {
+  const { randomUUID } = await import('node:crypto');
+  const otherOwnerId = randomUUID();
+  const now = new Date().toISOString();
+  db.prepare('INSERT INTO admin (id,username,email,display_name,password_hash,created_at) VALUES (?,?,?,?,?,?)')
+    .run(otherOwnerId, 'watchhost', 'watchhost@example.test', 'Watch Host', 'unused-test-hash', now);
+  const video = db.prepare(`SELECT id FROM files WHERE mime_type='video/mp4' ORDER BY created_at DESC LIMIT 1`).get() as any;
+  assert.ok(video, 'WATCH test video exists');
+
+  const discoverableId = randomUUID();
+  db.prepare(`INSERT INTO watch_rooms (id,owner_id,title,description,category,visibility,status,current_video_file_id,participant_limit,approval_required,chat_enabled,viewer_control_enabled,playback_state,playback_position_ms,playback_rate,playback_sequence,playback_updated_at,created_at,updated_at) VALUES (?,?,?,'','General','discoverable_private','waiting',?,12,1,1,0,'paused',0,1,0,?,?,?)`)
+    .run(discoverableId, otherOwnerId, 'Discoverable test room', video.id, now, now, now);
+  db.prepare(`INSERT INTO watch_participants (id,room_id,user_id,display_name,role,status,joined_at,last_seen_at) VALUES (?,?,?,'Watch Host','host','joined',?,?)`)
+    .run(randomUUID(), discoverableId, otherOwnerId, now, now);
+
+  const privateId = randomUUID();
+  db.prepare(`INSERT INTO watch_rooms (id,owner_id,title,description,category,visibility,status,current_video_file_id,participant_limit,approval_required,chat_enabled,viewer_control_enabled,playback_state,playback_position_ms,playback_rate,playback_sequence,playback_updated_at,created_at,updated_at) VALUES (?,?,?,'','General','private','waiting',?,12,0,1,0,'paused',0,1,0,?,?,?)`)
+    .run(privateId, otherOwnerId, 'Private hidden room', video.id, now, now, now);
+
+  const listed = await app.inject({ method: 'GET', url: '/api/watch/discovery', headers: { cookie } });
+  assert.equal(listed.statusCode, 200, listed.body);
+  assert.ok(listed.json().rooms.some((room: any) => room.id === discoverableId));
+  assert.ok(!listed.json().rooms.some((room: any) => room.id === privateId));
+  assert.ok(!listed.json().rooms.some((room: any) => room.title === 'Private test room'), 'the current owner does not see its own room in discovery');
+  assert.ok(listed.json().rooms.every((room: any) => !('invitationToken' in room) && !('videoPath' in room) && !('filePath' in room)));
 });
