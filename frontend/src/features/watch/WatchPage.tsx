@@ -32,6 +32,7 @@ export function WatchPage({ api, ping, onUpload }: { api: ApiFn; ping: (message:
   const [search,setSearch] = useState('');
   const [message,setMessage] = useState('');
   const [queueFile,setQueueFile] = useState('');
+  const [mediaStatus,setMediaStatus] = useState<'loading'|'ready'|'buffering'|'error'>('loading');
   const videoRef = useRef<HTMLVideoElement|null>(null);
   const syncingPlayer = useRef(false);
   const syncTimer = useRef<number|undefined>(undefined);
@@ -56,27 +57,53 @@ export function WatchPage({ api, ping, onUpload }: { api: ApiFn; ping: (message:
   useEffect(()=>{
     if (!selected) return;
     const roomId=selected.room.id;
-    const timer = window.setInterval(async()=>{
+    let active=true;
+    let timer:number|undefined;
+    const scheduleNext=()=>{ if(active) timer=window.setTimeout(poll,5000); };
+    const poll=async()=>{
       try {
         const snapshot=await api<WatchRoom>(`/api/watch/rooms/${roomId}`);
+        if(!active)return;
         setSelected(snapshot);
         const player=videoRef.current;
         if(player) {
           const target=snapshot.playback.positionMs/1000;
+          const enoughData=player.readyState>=HTMLMediaElement.HAVE_FUTURE_DATA;
           let shouldSuppress=false;
           if(snapshot.playback.state==='playing') {
-            if(Math.abs(player.currentTime-target)>2.2 && !player.seeking) { player.currentTime=target; shouldSuppress=true; }
-            if(player.paused && !player.ended) { shouldSuppress=true; void player.play().catch(()=>undefined); }
-          } else if(snapshot.playback.state==='paused' && !player.paused) { player.pause(); shouldSuppress=true; }
-          if(shouldSuppress) {
+            // Never seek a buffering player. Small drift is normal on a polled timeline;
+            // only correct large drift after the browser has future data available.
+            if(enoughData && !player.seeking && !player.paused && Math.abs(player.currentTime-target)>10) {
+              syncingPlayer.current=true;
+              player.currentTime=target;
+              shouldSuppress=true;
+            }
+            if(enoughData && player.paused && !player.ended) {
+              syncingPlayer.current=true;
+              shouldSuppress=true;
+              void player.play().catch(()=>undefined);
+            }
+          } else if(snapshot.playback.state==='paused' && !player.paused) {
             syncingPlayer.current=true;
+            player.pause();
+            shouldSuppress=true;
+          }
+          if(shouldSuppress) {
             if(syncTimer.current!==undefined) window.clearTimeout(syncTimer.current);
-            syncTimer.current=window.setTimeout(()=>{syncingPlayer.current=false;syncTimer.current=undefined;},500);
+            syncTimer.current=window.setTimeout(()=>{syncingPlayer.current=false;syncTimer.current=undefined;},800);
           }
         }
       } catch { /* A failed poll is reflected by the next successful snapshot. */ }
-    },3000);
-    return()=>{window.clearInterval(timer);if(syncTimer.current!==undefined)window.clearTimeout(syncTimer.current);syncingPlayer.current=false;syncTimer.current=undefined;};
+      finally { scheduleNext(); }
+    };
+    void poll();
+    return()=>{
+      active=false;
+      if(timer!==undefined)window.clearTimeout(timer);
+      if(syncTimer.current!==undefined)window.clearTimeout(syncTimer.current);
+      syncingPlayer.current=false;
+      syncTimer.current=undefined;
+    };
   },[selected?.room.id,api]);
   useEffect(()=>{ messageEndRef.current?.scrollIntoView({behavior:'smooth',block:'end'}); },[selected?.messages.length]);
 
@@ -128,7 +155,7 @@ export function WatchPage({ api, ping, onUpload }: { api: ApiFn; ping: (message:
       <div className="watch-main-column">
         <div className="watch-room-topline"><button className="watch-back" onClick={()=>{setSelected(null);setInvite(null);void refresh()}}><ArrowLeft size={15}/> All rooms</button><div className="watch-room-badges"><span className="watch-pill private"><LockKeyhole size={12}/> {selected.room.visibility==='private'?'Private':'Discoverable'}</span><span className="watch-pill live"><i/> {selected.room.status==='ended'?'Ended':selected.playback.state==='playing'?'Playing':'Room ready'}</span></div></div>
         {!selected.permissions?.canControl&&<div className="watch-notice"><LockKeyhole size={15}/><span>The host controls the shared timeline. You can start playback locally if your browser blocks automatic playback.</span></div>}
-        <div className="watch-player-frame"><video ref={videoRef} key={selected.room.id} controls playsInline preload="metadata" src={`/api/watch/rooms/${selected.room.id}/media`} onPlay={e=>{if(!syncingPlayer.current)void playback('play',e.currentTarget.currentTime)}} onPause={e=>{if(!syncingPlayer.current&&!e.currentTarget.ended)void playback('pause',e.currentTarget.currentTime)}} onSeeked={e=>{if(!syncingPlayer.current)void playback('seek',e.currentTarget.currentTime)}} /></div>
+        <div className="watch-player-frame"><video ref={videoRef} key={selected.room.id} controls playsInline preload="auto" src={`/api/watch/rooms/${selected.room.id}/media`} onLoadStart={()=>setMediaStatus('loading')} onCanPlay={()=>setMediaStatus('ready')} onWaiting={()=>setMediaStatus('buffering')} onStalled={()=>setMediaStatus('buffering')} onPlaying={()=>setMediaStatus('ready')} onError={()=>setMediaStatus('error')} onPlay={e=>{if(!syncingPlayer.current)void playback('play',e.currentTarget.currentTime)}} onPause={e=>{if(!syncingPlayer.current&&!e.currentTarget.ended)void playback('pause',e.currentTarget.currentTime)}} onSeeked={e=>{if(!syncingPlayer.current)void playback('seek',e.currentTarget.currentTime)}} />{mediaStatus!=='ready'&&<div className={`watch-player-overlay ${mediaStatus==='error'?'is-error':''}`} role="status" aria-live="polite"><span>{mediaStatus==='loading'?'Loading video…':mediaStatus==='buffering'?'Buffering…':'Video could not be loaded. Check the connection.'}</span>{mediaStatus==='error'&&<button className="watch-media-retry" onClick={()=>{setMediaStatus('loading');videoRef.current?.load()}}>Retry video</button>}</div>}</div>
         <div className="watch-now-playing"><div><span className="watch-overline">NOW IN THIS ROOM</span><h2>{selected.video?.name??selected.room.title}</h2><p>{selected.room.title} · {selected.participants.filter(p=>p.status==='joined').length} participants</p></div>{selected.permissions?.canInvite&&<button className="btn btn-secondary" onClick={createInvite}><Link2 size={15}/> Invite</button>}</div>
         {invite&&<div className="watch-invite-box"><div><b>Room invitation link</b><small>Expires in 24 hours · up to 20 uses</small><code>{invite.url}</code></div><button className="btn btn-primary" onClick={()=>{void navigator.clipboard.writeText(invite.url).then(()=>ping('Invitation link copied.')).catch(()=>ping('Copy failed. Please copy the link manually.','error'))}}><Copy size={15}/> Copy</button><button className="btn btn-danger btn-mini" onClick={async()=>{try{await api(`/api/watch/invitations/${invite.id}`,{method:'DELETE'});setInvite(null);ping('Invitation revoked.')}catch(e){ping((e as Error).message,'error')}}}>Revoke</button><button className="icon-btn" aria-label="Close invite" onClick={()=>setInvite(null)}><X size={17}/></button></div>}
         <div className="watch-detail-grid">
@@ -167,13 +194,13 @@ export function WatchInviteAccess({ api, token, onJoined }: { api:ApiFn; token:s
 }
 
 export function WatchGuestRoom({ api, roomId }: { api:ApiFn; roomId:string }) {
-  const [snapshot,setSnapshot]=useState<any>(null);const [error,setError]=useState('');const [message,setMessage]=useState('');const [needsGesture,setNeedsGesture]=useState(false);const player=useRef<HTMLVideoElement|null>(null);const syncing=useRef(false);
+  const [snapshot,setSnapshot]=useState<any>(null);const [error,setError]=useState('');const [message,setMessage]=useState('');const [needsGesture,setNeedsGesture]=useState(false);const [mediaStatus,setMediaStatus]=useState<'loading'|'ready'|'buffering'|'error'>('loading');const player=useRef<HTMLVideoElement|null>(null);const syncing=useRef(false);
   const load=useCallback(async()=>{try{const r=await api<any>(`/api/watch/guest/${roomId}`);setSnapshot(r);setError('')}catch(e){setError((e as Error).message)}},[api,roomId]);
   useEffect(()=>{void load();const timer=window.setInterval(()=>void load(),4000);return()=>window.clearInterval(timer)},[load]);
-  useEffect(()=>{if(snapshot?.status!=='joined')return;let live=true;const timer=window.setInterval(async()=>{try{const r=await api<any>(`/api/watch/guest/${roomId}/playback`);if(!live)return;const v=player.current;if(v){const target=r.playback.positionMs/1000;let changed=false;syncing.current=true;if(Math.abs(v.currentTime-target)>2.2&&!v.seeking){v.currentTime=target;changed=true}if(r.playback.state==='playing'&&v.paused){void v.play().then(()=>setNeedsGesture(false)).catch(()=>setNeedsGesture(true));changed=true}if(r.playback.state==='paused'&&!v.paused){v.pause();changed=true}if(changed)window.setTimeout(()=>{syncing.current=false},350);else syncing.current=false}}catch{}},3000);return()=>{live=false;window.clearInterval(timer)}},[api,roomId,snapshot?.status]);
-  const startSyncedPlayback=()=>{const v=player.current;if(!v)return;v.currentTime=Math.max(0,(snapshot?.playback?.positionMs??0)/1000);void v.play().then(()=>setNeedsGesture(false)).catch(()=>setNeedsGesture(true))};
+  useEffect(()=>{if(snapshot?.status!=='joined')return;let live=true;let timer:number|undefined;let syncTimer:number|undefined;const poll=async()=>{try{const r=await api<any>(`/api/watch/guest/${roomId}/playback`);if(!live)return;const v=player.current;if(v){const target=r.playback.positionMs/1000;const enoughData=v.readyState>=HTMLMediaElement.HAVE_FUTURE_DATA;let changed=false;if(r.playback.state==='playing'){if(enoughData&&!v.paused&&!v.seeking&&Math.abs(v.currentTime-target)>10){syncing.current=true;v.currentTime=target;changed=true}if(enoughData&&v.paused&&!v.ended&&!needsGesture){syncing.current=true;changed=true;void v.play().then(()=>setNeedsGesture(false)).catch(()=>setNeedsGesture(true))}}else if(r.playback.state==='paused'&&!v.paused){syncing.current=true;v.pause();changed=true}if(changed){if(syncTimer!==undefined)window.clearTimeout(syncTimer);syncTimer=window.setTimeout(()=>{syncing.current=false;syncTimer=undefined},800)}else syncing.current=false}}catch{/* retry on the next poll */}finally{if(live)timer=window.setTimeout(poll,5000)}};void poll();return()=>{live=false;if(timer!==undefined)window.clearTimeout(timer);if(syncTimer!==undefined)window.clearTimeout(syncTimer);syncing.current=false}},[api,roomId,snapshot?.status,needsGesture]);
+  const startSyncedPlayback=()=>{const v=player.current;if(!v||v.readyState<HTMLMediaElement.HAVE_METADATA)return;syncing.current=true;v.currentTime=Math.max(0,(snapshot?.playback?.positionMs??0)/1000);void v.play().then(()=>{setNeedsGesture(false);syncing.current=false}).catch(()=>{setNeedsGesture(true);syncing.current=false})};
   const send=async(e:React.FormEvent)=>{e.preventDefault();if(!message.trim())return;try{await api(`/api/watch/guest/${roomId}/messages`,{method:'POST',body:JSON.stringify({body:message.trim()})});setMessage('');await load()}catch(e){setError((e as Error).message)}};
   if(error)return <div className="watch-guest-shell"><div className="watch-guest-card"><CircleAlert size={24}/><h1>Room access unavailable</h1><p>{error}</p><button className="btn btn-secondary" onClick={()=>void load()}>Try again</button></div></div>;
   if(!snapshot||snapshot.status==='pending')return <div className="watch-guest-shell"><div className="watch-guest-card"><Clock3 size={28}/><h1>Waiting for approval</h1><p>{snapshot?.message??'Checking your room access…'}</p></div></div>;
-  return <main className="watch-guest-room"><header><b>NODEBASE <span>WATCH</span></b><span>{snapshot.room.title}</span><button className="btn btn-secondary btn-mini" onClick={async()=>{try{await api(`/api/watch/guest/${roomId}/leave`,{method:'POST',body:JSON.stringify({})});window.location.href='/'}catch(e){setError((e as Error).message)}}}>Leave room</button></header><div className="watch-guest-player"><video ref={player} controls playsInline preload="metadata" src={`/api/watch/guest/${roomId}/media`} onPlay={e=>{if(syncing.current||!snapshot.room.viewerControlEnabled)return;const v=e.currentTarget;void api(`/api/watch/guest/${roomId}/playback`,{method:'POST',body:JSON.stringify({action:'play',positionMs:Math.round(v.currentTime*1000)})}).catch(()=>void load())}} onPause={e=>{if(syncing.current||e.currentTarget.ended||!snapshot.room.viewerControlEnabled)return;const v=e.currentTarget;void api(`/api/watch/guest/${roomId}/playback`,{method:'POST',body:JSON.stringify({action:'pause',positionMs:Math.round(v.currentTime*1000)})}).catch(()=>void load())}} onSeeked={e=>{if(syncing.current||!snapshot.room.viewerControlEnabled)return;const v=e.currentTarget;void api(`/api/watch/guest/${roomId}/playback`,{method:'POST',body:JSON.stringify({action:'seek',positionMs:Math.round(v.currentTime*1000)})}).catch(()=>void load())}}/>{needsGesture&&snapshot.playback.state==='playing'&&<button className="watch-gesture-play" onClick={()=>void startSyncedPlayback()}><Play size={16} fill="currentColor"/> Start synced playback</button>}</div><section className="watch-guest-lower"><div><h1>{snapshot.room.title}</h1><p>You're watching as {snapshot.participant.displayName}. {snapshot.room.viewerControlEnabled?'Room members can control the shared timeline.':'The host controls the shared timeline.'}</p><div className="watch-participant-chips">{snapshot.participants.map((p:any)=><span key={p.id}>{p.display_name}{p.role==='host'?' · Host':''}</span>)}</div></div><section className="watch-guest-chat"><b><MessageCircle size={15}/> Room chat</b><div className="watch-guest-chat-list">{snapshot.messages.map((m:any)=><p key={m.id}><strong>{m.display_name}:</strong> {m.body}</p>)}</div><form onSubmit={send}><input value={message} onChange={e=>setMessage(e.target.value)} placeholder="Message room…" maxLength={1000}/><button disabled={!message.trim()}><Send size={15}/></button></form></section></section></main>;
+  return <main className="watch-guest-room"><header><b>NODEBASE <span>WATCH</span></b><span>{snapshot.room.title}</span><button className="btn btn-secondary btn-mini" onClick={async()=>{try{await api(`/api/watch/guest/${roomId}/leave`,{method:'POST',body:JSON.stringify({})});window.location.href='/'}catch(e){setError((e as Error).message)}}}>Leave room</button></header><div className="watch-guest-player"><video ref={player} controls playsInline preload="auto" src={`/api/watch/guest/${roomId}/media`} onLoadStart={()=>setMediaStatus('loading')} onCanPlay={()=>setMediaStatus('ready')} onWaiting={()=>setMediaStatus('buffering')} onStalled={()=>setMediaStatus('buffering')} onPlaying={()=>setMediaStatus('ready')} onError={()=>setMediaStatus('error')} onPlay={e=>{if(syncing.current||!snapshot.room.viewerControlEnabled)return;const v=e.currentTarget;void api(`/api/watch/guest/${roomId}/playback`,{method:'POST',body:JSON.stringify({action:'play',positionMs:Math.round(v.currentTime*1000)})}).catch(()=>void load())}} onPause={e=>{if(syncing.current||e.currentTarget.ended||!snapshot.room.viewerControlEnabled)return;const v=e.currentTarget;void api(`/api/watch/guest/${roomId}/playback`,{method:'POST',body:JSON.stringify({action:'pause',positionMs:Math.round(v.currentTime*1000)})}).catch(()=>void load())}} onSeeked={e=>{if(syncing.current||!snapshot.room.viewerControlEnabled)return;const v=e.currentTarget;void api(`/api/watch/guest/${roomId}/playback`,{method:'POST',body:JSON.stringify({action:'seek',positionMs:Math.round(v.currentTime*1000)})}).catch(()=>void load())}}/>{mediaStatus!=='ready'&&<div className={`watch-player-overlay ${mediaStatus==='error'?'is-error':''}`} role="status" aria-live="polite"><span>{mediaStatus==='loading'?'Loading video…':mediaStatus==='buffering'?'Buffering…':'Video could not be loaded. Check the connection.'}</span>{mediaStatus==='error'&&<button className="watch-media-retry" onClick={()=>{setMediaStatus('loading');player.current?.load()}}>Retry video</button>}</div>}{needsGesture&&snapshot.playback.state==='playing'&&<button className="watch-gesture-play" onClick={()=>void startSyncedPlayback()}><Play size={16} fill="currentColor"/> Start synced playback</button>}</div><section className="watch-guest-lower"><div><h1>{snapshot.room.title}</h1><p>You're watching as {snapshot.participant.displayName}. {snapshot.room.viewerControlEnabled?'Room members can control the shared timeline.':'The host controls the shared timeline.'}</p><div className="watch-participant-chips">{snapshot.participants.map((p:any)=><span key={p.id}>{p.display_name}{p.role==='host'?' · Host':''}</span>)}</div></div><section className="watch-guest-chat"><b><MessageCircle size={15}/> Room chat</b><div className="watch-guest-chat-list">{snapshot.messages.map((m:any)=><p key={m.id}><strong>{m.display_name}:</strong> {m.body}</p>)}</div><form onSubmit={send}><input value={message} onChange={e=>setMessage(e.target.value)} placeholder="Message room…" maxLength={1000}/><button disabled={!message.trim()}><Send size={15}/></button></form></section></section></main>;
 }

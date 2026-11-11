@@ -320,12 +320,64 @@ test('WATCH creates private rooms, issues scoped invitations, joins guests, and 
   });
   assert.equal(guestCannotControl.statusCode, 403, 'ordinary guests cannot change the host-controlled timeline');
 
-  const mediaRange = await app.inject({ method: 'GET', url: `/api/watch/guest/${roomId}/media`, headers: { cookie: guestCookie, range: 'bytes=0-4' } });
+  const mediaUrl = `/api/watch/guest/${roomId}/media`;
+  const hostMedia = await app.inject({ method: 'GET', url: `/api/watch/rooms/${roomId}/media`, headers: { cookie } });
+  assert.equal(hostMedia.statusCode, 200, hostMedia.body);
+  assert.equal(hostMedia.body, media.toString(), 'the authenticated host can stream the room media');
+
+  const fullMedia = await app.inject({ method: 'GET', url: mediaUrl, headers: { cookie: guestCookie } });
+  assert.equal(fullMedia.statusCode, 200, fullMedia.body);
+  assert.equal(fullMedia.body, media.toString());
+  assert.equal(fullMedia.headers['accept-ranges'], 'bytes');
+  assert.equal(fullMedia.headers['content-length'], String(media.length));
+  assert.equal(fullMedia.headers['cache-control'], 'private, no-store');
+  assert.ok(fullMedia.headers['last-modified']);
+
+  const mediaRange = await app.inject({ method: 'GET', url: mediaUrl, headers: { cookie: guestCookie, range: 'bytes=0-4' } });
   assert.equal(mediaRange.statusCode, 206, mediaRange.body);
   assert.equal(mediaRange.body, '01234');
   assert.equal(mediaRange.headers['content-range'], `bytes 0-4/${media.length}`);
-  const invalidRange = await app.inject({ method: 'GET', url: `/api/watch/guest/${roomId}/media`, headers: { cookie: guestCookie, range: 'bytes=-0' } });
+
+  const matchingIfRange = await app.inject({ method: 'GET', url: mediaUrl, headers: { cookie: guestCookie, range: 'bytes=0-4', 'if-range': fullMedia.headers['last-modified']! } });
+  assert.equal(matchingIfRange.statusCode, 206, matchingIfRange.body);
+  assert.equal(matchingIfRange.body, '01234', 'a current Last-Modified validator preserves the partial response');
+
+  const openEndedRange = await app.inject({ method: 'GET', url: mediaUrl, headers: { cookie: guestCookie, range: 'bytes=10-' } });
+  assert.equal(openEndedRange.statusCode, 206, openEndedRange.body);
+  assert.equal(openEndedRange.body, media.subarray(10).toString());
+  assert.equal(openEndedRange.headers['content-range'], `bytes 10-${media.length - 1}/${media.length}`);
+
+  const suffixRange = await app.inject({ method: 'GET', url: mediaUrl, headers: { cookie: guestCookie, range: 'bytes=-5' } });
+  assert.equal(suffixRange.statusCode, 206, suffixRange.body);
+  assert.equal(suffixRange.body, 'vwxyz');
+
+  const clampedRange = await app.inject({ method: 'GET', url: mediaUrl, headers: { cookie: guestCookie, range: 'bytes=30-999' } });
+  assert.equal(clampedRange.statusCode, 206, clampedRange.body);
+  assert.equal(clampedRange.body, media.subarray(30).toString());
+  assert.equal(clampedRange.headers['content-range'], `bytes 30-${media.length - 1}/${media.length}`);
+
+  const staleIfRange = await app.inject({ method: 'GET', url: mediaUrl, headers: { cookie: guestCookie, range: 'bytes=0-4', 'if-range': '"stale-etag"' } });
+  assert.equal(staleIfRange.statusCode, 200, staleIfRange.body);
+  assert.equal(staleIfRange.body, media.toString(), 'a stale If-Range validator falls back to the full representation');
+
+  const multipleRanges = await app.inject({ method: 'GET', url: mediaUrl, headers: { cookie: guestCookie, range: 'bytes=0-1,3-4' } });
+  assert.equal(multipleRanges.statusCode, 416, 'unsupported multipart ranges are rejected');
+  assert.equal(multipleRanges.headers['content-range'], `bytes */${media.length}`);
+
+  const invalidRange = await app.inject({ method: 'GET', url: mediaUrl, headers: { cookie: guestCookie, range: 'bytes=-0' } });
   assert.equal(invalidRange.statusCode, 416, 'zero-length suffix ranges are rejected');
+  assert.equal(invalidRange.headers['content-range'], `bytes */${media.length}`);
+
+  const outOfBoundsRange = await app.inject({ method: 'GET', url: mediaUrl, headers: { cookie: guestCookie, range: `bytes=${media.length}-` } });
+  assert.equal(outOfBoundsRange.statusCode, 416, 'a range starting beyond EOF is unsatisfied');
+  assert.equal(outOfBoundsRange.headers['content-range'], `bytes */${media.length}`);
+
+  const reversedRange = await app.inject({ method: 'GET', url: mediaUrl, headers: { cookie: guestCookie, range: 'bytes=8-2' } });
+  assert.equal(reversedRange.statusCode, 416, 'a reversed range is unsatisfied');
+  assert.equal(reversedRange.headers['content-range'], `bytes */${media.length}`);
+
+  const crossRoomGuest = await app.inject({ method: 'GET', url: `/api/watch/guest/${randomUUID()}/media`, headers: { cookie: guestCookie } });
+  assert.equal(crossRoomGuest.statusCode, 401, 'a room-scoped guest cookie cannot be replayed against another room');
 
   const unauthenticatedMedia = await app.inject({ method: 'GET', url: `/api/watch/guest/${roomId}/media` });
   assert.equal(unauthenticatedMedia.statusCode, 401);

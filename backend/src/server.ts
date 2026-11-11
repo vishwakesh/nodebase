@@ -1148,36 +1148,89 @@ function sendWatchMedia(roomId: string, request: FastifyRequest, reply: FastifyR
   if (room.status === 'ended' || room.status === 'expired') throw conflict('This watch room has ended.');
   const file = db.prepare('SELECT * FROM files WHERE id=?').get(room.current_video_file_id) as any;
   if (!file) throw notFound('The room video is no longer available.');
-  if (!['video/mp4','video/webm'].includes(file.mime_type)) throw Object.assign(new Error('The alpha player currently supports MP4 and WebM files. HLS processing is not enabled yet.'),{statusCode:415});
+  if (!['video/mp4','video/webm'].includes(file.mime_type)) {
+    throw Object.assign(new Error('The alpha player currently supports MP4 and WebM files. HLS processing is not enabled yet.'), { statusCode: 415 });
+  }
+
   const target = blobPath(file.blob_name);
-  let stat: any;
+  let stat: fs.Stats;
   try { stat = fs.statSync(target); } catch { throw notFound('Stored video content is missing.'); }
   if (!stat.isFile() || stat.size <= 0) throw badRequest('The selected video file is empty or unavailable.');
-  const range = request.headers.range;
-  let start = 0; let end = stat.size - 1; let status = 200;
-  if (range) {
-    const match = /^bytes=(\d*)-(\d*)$/.exec(range.trim());
-    const unsatisfied = () => reply.code(416).header('Content-Range', `bytes */${stat.size}`).header('Accept-Ranges', 'bytes').send();
+
+  const unsatisfied = () => reply.code(416)
+    .header('Accept-Ranges', 'bytes')
+    .header('Content-Range', `bytes */${stat.size}`)
+    .header('Content-Length', '0')
+    .header('Cache-Control', 'private, no-store')
+    .send();
+
+  let start = 0;
+  let end = stat.size - 1;
+  let status: 200 | 206 = 200;
+  const rangeHeader = request.headers.range;
+  const ifRange = request.headers['if-range'];
+
+  // If-Range prevents combining a stale partial response with a changed object.
+  // This endpoint intentionally does not expose an entity tag for private media;
+  // a valid date validator can still be honoured, otherwise the full body is sent.
+  let useRange = Boolean(rangeHeader);
+  if (useRange && ifRange) {
+    const validatorDate = Date.parse(ifRange);
+    useRange = Number.isFinite(validatorDate) && Math.floor(stat.mtimeMs / 1000) * 1000 <= validatorDate;
+  }
+
+  if (useRange && rangeHeader) {
+    // Browsers normally ask for a single byte range. Reject multipart ranges
+    // instead of accidentally serving a malformed partial response.
+    const match = /^bytes=(\d*)-(\d*)$/i.exec(rangeHeader.trim());
     if (!match || (!match[1] && !match[2])) return unsatisfied();
+
     if (!match[1]) {
-      const suffix = Number(match[2]);
-      if (!Number.isSafeInteger(suffix) || suffix <= 0) return unsatisfied();
-      start = Math.max(0, stat.size - suffix);
+      const suffixLength = Number(match[2]);
+      if (!Number.isSafeInteger(suffixLength) || suffixLength <= 0) return unsatisfied();
+      start = Math.max(0, stat.size - suffixLength);
     } else {
       start = Number(match[1]);
-      if (!Number.isSafeInteger(start)) return unsatisfied();
+      if (!Number.isSafeInteger(start) || start < 0) return unsatisfied();
     }
+
     if (match[2] && match[1]) {
       const requestedEnd = Number(match[2]);
-      if (!Number.isSafeInteger(requestedEnd)) return unsatisfied();
+      if (!Number.isSafeInteger(requestedEnd) || requestedEnd < 0) return unsatisfied();
       end = Math.min(stat.size - 1, requestedEnd);
     }
+
     if (start >= stat.size || end < start) return unsatisfied();
     status = 206;
   }
-  reply.code(status).header('Accept-Ranges','bytes').header('Content-Type',file.mime_type).header('Content-Length',end-start+1).header('Content-Disposition',`inline; filename*=UTF-8''${encodeURIComponent(file.name)}`).header('Cache-Control','private, no-store').header('X-Content-Type-Options','nosniff');
-  if (status === 206) reply.header('Content-Range',`bytes ${start}-${end}/${stat.size}`);
-  return reply.send(fs.createReadStream(target,{start,end}));
+
+  const contentLength = end - start + 1;
+  reply.code(status)
+    .header('Accept-Ranges', 'bytes')
+    .header('Content-Type', file.mime_type)
+    .header('Content-Length', String(contentLength))
+    .header('Last-Modified', stat.mtime.toUTCString())
+    .header('Content-Disposition', `inline; filename*=UTF-8''${encodeURIComponent(file.name)}`)
+    .header('Cache-Control', 'private, no-store')
+    .header('X-Content-Type-Options', 'nosniff')
+    .header('X-Accel-Buffering', 'no');
+
+  if (status === 206) reply.header('Content-Range', `bytes ${start}-${end}/${stat.size}`);
+
+  // A larger read buffer reduces tiny disk reads for large media objects.
+  // The stream is destroyed when the client disconnects to avoid wasted I/O.
+  const stream = fs.createReadStream(target, { start, end, highWaterMark: 256 * 1024 });
+  reply.raw.once('close', () => {
+    // `close` also fires after a normal completed response. Only abort disk I/O
+    // when the socket closed before Node finished flushing the response.
+    if (!reply.raw.writableFinished && !stream.destroyed) stream.destroy();
+  });
+  stream.once('error', (error) => {
+    // Fastify's stream reply pipeline owns the HTTP error response; this listener
+    // adds room context to logs without attempting a second reply.send().
+    request.log.error({ err: error, roomId }, 'Watch media stream failed');
+  });
+  return reply.send(stream);
 }
 const watchRoomCreateSchema = z.object({ title:z.string().trim().min(2).max(100),description:z.string().trim().max(500).default(''),category:z.string().trim().min(1).max(40).default('General'),videoFileId:z.string().uuid(),visibility:z.enum(['private','discoverable_private']).default('private'),participantLimit:z.number().int().min(2).max(50).default(12),approvalRequired:z.boolean().default(false),chatEnabled:z.boolean().default(true),viewerControlEnabled:z.boolean().default(false) });
 app.get('/api/watch/overview', async (request) => {

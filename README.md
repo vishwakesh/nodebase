@@ -1,16 +1,16 @@
-# NODEBASE V4 Foundation — Development Snapshot
+# NODEBASE V5 — Development Workspace (V4-derived)
 
 **Build. Debug. Deploy. Organize. Connect.**
 
-This development snapshot is based on the `feat/nodebase-watch` branch and the V3 Obsidian + Acid Lime workspace foundation (`feat/nodebase-v3-workspace`) and approved V2 multi-node foundation. It retains the existing hosting, nodes, bot workspaces, backups, activity, Cloud screens, balanced layout primitives, and System/Light/Dark theme behavior.
+This is the isolated NODEBASE V5 working copy, based on the debugged V4 foundation snapshot. It preserves the existing React + Vite frontend, Fastify API, SQLite metadata, private disk-backed blobs, authenticated Docker runner, account and organization foundations, hosting, nodes, backups, activity and Cloud modules while the frontend is being rebuilt.
 
-The Watch increment adds a Watch alpha: Cloud-backed MP4/WebM library discovery, private and discoverable-private rooms, hashed invitations, room-scoped guest sessions, progressive byte-range playback, server-stored playback state, room chat, and queue foundations. HLS transcoding, resumable multipart uploads, authenticated segment delivery, WebSocket synchronization, and production media analytics are not yet implemented. See [`docs/watch/IMPLEMENTATION-STATUS.md`](docs/watch/IMPLEMENTATION-STATUS.md), [`docs/watch/PRD.md`](docs/watch/PRD.md), and [`docs/watch/ARCHITECTURE.md`](docs/watch/ARCHITECTURE.md). AI Builder, NVIDIA provider workflows, Bug Hunter, Auto Fixer, Auto Setup, and Notes remain future V3 modules. This branch is not a production-complete streaming release.
+The first V5 stabilization increment focuses on Watch playback reliability: buffering-aware host/guest synchronization, clearer loading and media error states, and hardened private MP4/WebM byte-range delivery. The media path remains progressive streaming. HLS transcoding, resumable multipart uploads, authenticated HLS segment delivery, WebSocket synchronization and production media analytics are not implemented. See [`docs/watch/IMPLEMENTATION-STATUS.md`](docs/watch/IMPLEMENTATION-STATUS.md), [`docs/watch/PRD.md`](docs/watch/PRD.md), [`docs/watch/ARCHITECTURE.md`](docs/watch/ARCHITECTURE.md) and [`docs/v5/WORK-STATUS.md`](docs/v5/WORK-STATUS.md).
 
-**Existing foundation:** A self-hosted Discord bot workspace and private file cloud. The current implementation uses a React dashboard, Fastify API, SQLite metadata, private disk-backed file objects, and a separate authenticated Docker runner.
+**Frontend direction:** A precise, technical operations workspace using the existing NODEBASE acid-lime identity, quiet neutral surfaces, real service state, accessible controls and mobile parity. Project-local UI guides are stored under [`.agents/skills/`](.agents/skills/).
 
-**V4 rollout boundary:** This increment provides multi-account identity and organization foundations. The existing V3 hosting/file/Watch control plane remains protected for platform administrators only until its queries are migrated to enforce organization ownership. New members are not allowed into those unscoped handlers.
+**V4 compatibility boundary:** This baseline provides multi-account identity and organization foundations. Existing V3 hosting/file/Watch resource APIs remain restricted to platform administrators until their queries fully enforce organization ownership. Regular members are not allowed into unscoped handlers.
 
-> **Deployment status:** This repository is a fresh implementation. It has not been deployed to your VPS from this workspace. Run the build and test steps below, then deploy through your existing Coolify instance. The bot runner requires Docker socket access on the host and is deliberately kept on a private Compose network.
+> **Deployment status:** This is a local V5 development copy. It has not been deployed to your VPS. Production containers, databases, storage, Coolify, Caddy and unrelated services remain untouched. Run full workspace typechecks, builds, integration tests and streaming checks before any deployment decision.
 
 ## Preserved V2 multi-node foundation
 
