@@ -20,15 +20,15 @@
   --brand-warm-ivory: #E8D9B5;
 
   /* Light semantic surfaces */
-  --color-bg: #F6F8F3;
+  --color-bg: #F4F6F2;
   --color-surface: #FFFFFF;
-  --color-surface-secondary: #EDF1E9;
+  --color-surface-secondary: #EEF1EC;
   --color-surface-elevated: #FFFFFF;
-  --color-surface-hover: #F0F4EA;
+  --color-surface-hover: #F0F3EE;
   --color-text-primary: #172016;
-  --color-text-secondary: #596653;
-  --color-text-muted: #75816F;
-  --color-border: #DFE6D8;
+  --color-text-secondary: #536052;
+  --color-text-muted: #687565;
+  --color-border: #DDE4DA;
   --color-border-strong: #C9D4C0;
   --color-action: #B6F36B;
   --color-action-hover: #A5E651;
@@ -48,13 +48,13 @@
   --color-offline: #697568;
 
   /* Balanced workspace layout */
-  --sidebar-width: 248px;
+  --sidebar-width: 256px;
   --sidebar-collapsed-width: 76px;
   --header-height: 64px;
   --header-height-mobile: 56px;
   --content-max-width: 1440px;
   --page-padding-x: 32px;
-  --page-padding-y: 28px;
+  --page-padding-y: 32px;
 
   /* 4px spacing scale */
   --space-1: 4px;
@@ -105,14 +105,14 @@
 :root[data-theme="dark"] {
   color-scheme: dark;
   --color-bg: #0B0F0C;
-  --color-surface: #111411;
-  --color-surface-secondary: #182019;
+  --color-surface: #121713;
+  --color-surface-secondary: #1A211B;
   --color-surface-elevated: #202820;
-  --color-surface-hover: #202820;
+  --color-surface-hover: #222A23;
   --color-text-primary: #F5F7F2;
-  --color-text-secondary: #C1CCBB;
-  --color-text-muted: #91A08D;
-  --color-border: #2C382D;
+  --color-text-secondary: #B7C2B5;
+  --color-text-muted: #98A596;
+  --color-border: #2B352C;
   --color-border-strong: #3D4C3C;
   --color-action: #B6F36B;
   --color-action-hover: #C5FA85;
